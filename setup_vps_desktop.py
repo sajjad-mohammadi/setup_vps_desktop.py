@@ -1145,28 +1145,6 @@ def protect_routes_now() -> None:
     log_success(f"Protected {protected} Cloudflare routes.")
     
 
-# ── Route protection (auto-added by VPS Desktop script) ──────────
-script-security 2
-route-up {route_script}
-
-# Ignore server's redirect-gateway (we add our own default route)
-pull-filter ignore "redirect-gateway"
-
-# Accept everything else the server pushes (DNS, routes, etc.)
-# ── END route protection ─────────────────────────────────────────
-"""
-
-        with open(patched_config, "w") as fh:
-            fh.write(config_content)
-        os.chmod(patched_config, 0o600)
-
-        log_success("Protected VPN config built.")
-        return True
-
-    except Exception as exc:
-        log_err(f"Failed to build config: {exc}")
-        return False
-
 # ══════════════════════════════════════════════════════════════════
 # OPENVPN CONNECTION WITH CLOUDFLARE PROTECTION
 # ══════════════════════════════════════════════════════════════════
