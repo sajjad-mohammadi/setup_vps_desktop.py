@@ -950,16 +950,11 @@ def install_windscribe() -> None:
 # ══════════════════════════════════════════════════════════════════
 # 12. OPENVPN CLIENT
 # ══════════════════════════════════════════════════════════════════
-def install_and_connect_openvpn() -> None:
+def install_openvpn_only() -> None:
     """
-    Install OpenVPN, find .ovpn config, ask credentials, connect.
-    Uses vpn_connect_with_protection() for safe VPN switching.
+    Only installs OpenVPN package. Does NOT connect.
+    Connection happens after Cloudflare tunnel is up.
     """
-    import getpass
-
-    log_info("Setting up OpenVPN client...")
-
-    # Install OpenVPN + dig for DNS resolution
     try:
         log_info("Installing OpenVPN and DNS tools...")
         run_cmd_live(
@@ -969,87 +964,9 @@ def install_and_connect_openvpn() -> None:
         log_success("OpenVPN installed.")
     except Exception as exc:
         log_err(f"OpenVPN installation failed: {exc}")
-        return
 
-    # Save network info BEFORE connecting
+    # Save network info now while routing is still clean
     save_original_network()
-
-    # Find .ovpn files
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_info(f"Looking for .ovpn files in: {script_dir}")
-    ovpn_files = sorted(glob.glob(os.path.join(script_dir, "*.ovpn")))
-
-    if not ovpn_files:
-        log_warn(
-            "No .ovpn config file found.\n"
-            f"  Place your .ovpn file in: {script_dir}\n"
-            "  You can connect later using the OpenVPN Switcher "
-            "(Ctrl+C in supervisor)."
-        )
-        return
-
-    # Select config
-    if len(ovpn_files) == 1:
-        ovpn_config = ovpn_files[0]
-        log_success(f"Found config: {os.path.basename(ovpn_config)}")
-    else:
-        print()
-        log_info("Multiple .ovpn files found:")
-        for i, f in enumerate(ovpn_files, 1):
-            print(
-                f"  {Colors.OKCYAN}[{i}]{Colors.ENDC} "
-                f"{os.path.basename(f)}"
-            )
-        print()
-
-        while True:
-            try:
-                choice = input(
-                    f"{Colors.OKBLUE}[?] Select config "
-                    f"[1-{len(ovpn_files)}]: {Colors.ENDC}"
-                ).strip()
-                idx = int(choice) - 1
-                if 0 <= idx < len(ovpn_files):
-                    ovpn_config = ovpn_files[idx]
-                    break
-                log_warn(
-                    f"Enter a number between 1 and {len(ovpn_files)}"
-                )
-            except ValueError:
-                log_warn("Enter a valid number.")
-            except (KeyboardInterrupt, EOFError):
-                print()
-                log_warn("OpenVPN setup skipped.")
-                return
-
-    log_success(f"Using: {os.path.basename(ovpn_config)}")
-
-    # Ask credentials
-    print()
-    log_info("OpenVPN credentials required:")
-    print()
-
-    try:
-        username = input(
-            f"  {Colors.OKCYAN}Username:{Colors.ENDC} "
-        ).strip()
-        if not username:
-            log_warn("Empty username — skipped.")
-            return
-
-        password = getpass.getpass(
-            f"  {Colors.OKCYAN}Password:{Colors.ENDC} "
-        ).strip()
-        if not password:
-            log_warn("Empty password — skipped.")
-            return
-    except (KeyboardInterrupt, EOFError):
-        print()
-        log_warn("OpenVPN setup skipped.")
-        return
-
-    # Connect with full protection
-    vpn_connect_with_protection(ovpn_config, username, password)
 
 def create_openvpn_desktop_shortcut() -> None:
     """
@@ -1288,7 +1205,73 @@ def protect_routes_now() -> None:
             pass
 
     log_success(f"Protected {protected} Cloudflare routes.")
+    
+def protect_cloudflare_tunnel_domain(tunnel_url: str) -> None:
+    """
+    When Cloudflare assigns a tunnel URL like
+    https://abc-xyz.trycloudflare.com, resolve its actual
+    IP and add a protected route so OpenVPN never captures it.
+    """
+    if not tunnel_url or not _SAVED_GATEWAY:
+        return
 
+    log_info(f"Protecting Cloudflare tunnel domain: {tunnel_url}")
+
+    # Extract hostname from URL
+    hostname = tunnel_url.replace("https://", "").replace("http://", "")
+    hostname = hostname.split("/")[0]
+
+    # Resolve hostname to IPs
+    protected = 0
+    try:
+        import socket as sock_mod
+        results = sock_mod.getaddrinfo(hostname, None)
+        for r in results:
+            ip = r[4][0]
+            if ':' in ip:
+                continue
+            result = subprocess.run(
+                [
+                    'ip', 'route', 'replace',
+                    f'{ip}/32',
+                    'via', _SAVED_GATEWAY,
+                    'dev', _SAVED_INTERFACE or 'eth0',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                protected += 1
+                log_info(f"  Protected: {hostname} → {ip}")
+    except Exception as exc:
+        log_warn(f"  Could not resolve {hostname}: {exc}")
+
+    # Also protect trycloudflare.com itself
+    try:
+        import socket as sock_mod
+        results = sock_mod.getaddrinfo("trycloudflare.com", None)
+        for r in results:
+            ip = r[4][0]
+            if ':' in ip:
+                continue
+            subprocess.run(
+                [
+                    'ip', 'route', 'replace',
+                    f'{ip}/32',
+                    'via', _SAVED_GATEWAY,
+                    'dev', _SAVED_INTERFACE or 'eth0',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            protected += 1
+    except Exception:
+        pass
+
+    if protected > 0:
+        log_success(f"  Protected {protected} tunnel domain route(s).")
+    else:
+        log_warn("  Could not protect tunnel domain routes.")
 
 def build_protected_ovpn_config(
     ovpn_config: str,
@@ -1495,6 +1478,10 @@ def vpn_connect_with_protection(
     log_info("Re-applying route protection after VPN connected...")
     time.sleep(2)
     protect_routes_now()
+
+    # Protect the specific Cloudflare tunnel domain
+    if supervisor_ref and supervisor_ref.tunnel_url:
+        protect_cloudflare_tunnel_domain(supervisor_ref.tunnel_url)
 
     # ── 8. Restart Cloudflare tunnel if it died ──────────────────
     if supervisor_ref is not None:
@@ -2319,26 +2306,39 @@ class ServiceSupervisor:
     # ── Main supervisor loop ──────────────────────────────────────
     def run(self) -> None:
         """
-        Start all three services, then enter a monitoring loop.
-        Press Ctrl+C once  → open OpenVPN Config Switcher
-        Press Ctrl+C twice → shut everything down
+        Start all services in correct order:
+          1. VNC server
+          2. NoVNC proxy
+          3. Cloudflare tunnel (get public URL)
+          4. Connect OpenVPN (AFTER tunnel is up)
+          5. Monitor everything
+
+        Press Ctrl+C once  → OpenVPN Switcher
+        Press Ctrl+C twice → Stop everything
         """
         C = Colors
 
         log_info("Starting Service Supervisor...")
         print(f"{C.OKCYAN}{'─' * 66}{C.ENDC}")
 
-        # ── Initial startup sequence ─────────────────────────────
-        log_info("Phase 1/3: Starting VNC server...")
+        # ── Phase 1: VNC ─────────────────────────────────────────
+        log_info("Phase 1/4: Starting VNC server...")
         self.ensure_vnc()
         time.sleep(3)
 
-        log_info("Phase 2/3: Starting NoVNC proxy...")
+        # ── Phase 2: NoVNC ───────────────────────────────────────
+        log_info("Phase 2/4: Starting NoVNC proxy...")
         self.ensure_novnc()
         time.sleep(2)
 
-        log_info("Phase 3/3: Starting Cloudflare tunnel...")
+        # ── Phase 3: Cloudflare tunnel ───────────────────────────
+        log_info("Phase 3/4: Starting Cloudflare tunnel...")
         self.ensure_cloudflared()
+        time.sleep(2)
+
+        # ── Phase 4: OpenVPN (NOW safe — tunnel is up) ───────────
+        log_info("Phase 4/4: OpenVPN connection...")
+        self._initial_openvpn_connect()
 
         print(f"{C.OKCYAN}{'─' * 66}{C.ENDC}")
         log_success(
@@ -2349,38 +2349,123 @@ class ServiceSupervisor:
         print(f"{C.OKCYAN}{'─' * 66}{C.ENDC}")
 
         # ── Monitoring loop ──────────────────────────────────────
+        self._monitor_loop()
+
+    def _initial_openvpn_connect(self) -> None:
+        """
+        Called once after Cloudflare tunnel is running.
+        Finds .ovpn files, asks credentials, connects with protection.
+        """
+        import getpass
+        C = Colors
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ovpn_files = sorted(glob.glob(os.path.join(script_dir, "*.ovpn")))
+
+        if not ovpn_files:
+            log_warn(
+                "No .ovpn config files found.\n"
+                f"  Place .ovpn files in: {script_dir}\n"
+                "  Use Ctrl+C later to open the OpenVPN Switcher."
+            )
+            return
+
+        print()
+        log_info("OpenVPN configs found:")
+        for i, f in enumerate(ovpn_files, 1):
+            print(
+                f"  {C.OKCYAN}[{i}]{C.ENDC} {os.path.basename(f)}"
+            )
+        print(f"  {C.WARNING}[S]{C.ENDC} Skip — connect later")
+        print()
+
+        # Let user choose
+        while True:
+            try:
+                choice = input(
+                    f"  {C.OKBLUE}[?] Select config "
+                    f"[1-{len(ovpn_files)}/S]: {C.ENDC}"
+                ).strip().upper()
+
+                if choice == 'S' or choice == '':
+                    log_info("OpenVPN connection skipped. Use Ctrl+C to connect later.")
+                    return
+
+                idx = int(choice) - 1
+                if 0 <= idx < len(ovpn_files):
+                    ovpn_config = ovpn_files[idx]
+                    break
+                log_warn(f"Enter 1-{len(ovpn_files)} or S.")
+            except ValueError:
+                log_warn("Enter a number or S.")
+            except (KeyboardInterrupt, EOFError):
+                print()
+                log_info("Skipped.")
+                return
+
+        log_success(f"Selected: {os.path.basename(ovpn_config)}")
+        print()
+
+        # Ask credentials
+        try:
+            username = input(
+                f"  {C.OKCYAN}Username:{C.ENDC} "
+            ).strip()
+            if not username:
+                log_warn("Empty username — skipped.")
+                return
+
+            password = getpass.getpass(
+                f"  {C.OKCYAN}Password:{C.ENDC} "
+            ).strip()
+            if not password:
+                log_warn("Empty password — skipped.")
+                return
+        except (KeyboardInterrupt, EOFError):
+            print()
+            log_warn("Skipped.")
+            return
+
+        # Protect tunnel domain BEFORE connecting VPN
+        if self.tunnel_url:
+            protect_cloudflare_tunnel_domain(self.tunnel_url)
+
+        # Connect with full protection
+        vpn_connect_with_protection(
+            ovpn_config, username, password, supervisor_ref=self
+        )
+
+    def _monitor_loop(self) -> None:
+        """Health check loop with Ctrl+C handling for VPN switcher."""
+        C = Colors
         last_interrupt = 0
+
         try:
             while self.running:
                 time.sleep(10)
 
-                # Check VNC
+                # Health checks
                 if not is_vnc_running():
                     log_warn("Health check: VNC is down!")
                     self.ensure_vnc()
                     time.sleep(3)
 
-                # Check NoVNC
                 if not is_port_open(6080):
                     log_warn("Health check: NoVNC proxy is down!")
                     self.ensure_novnc()
                     time.sleep(2)
 
-                # Check Cloudflare tunnel
                 if not self._is_cloudflared_alive():
-                    log_warn(
-                        "Health check: Cloudflare tunnel died — "
-                        "restarting..."
-                    )
+                    log_warn("Health check: Cloudflare tunnel died — restarting...")
                     self.ensure_cloudflared()
 
         except KeyboardInterrupt:
             now = time.time()
 
-            # Double Ctrl+C within 2 seconds → full shutdown
+            # Double Ctrl+C within 2 seconds → shutdown
             if now - last_interrupt < 2:
                 print()
-                log_info("Double Ctrl+C — shutting down all services...")
+                log_info("Double Ctrl+C — shutting down...")
                 self.running = False
                 self.stop_all()
                 return
@@ -2388,54 +2473,27 @@ class ServiceSupervisor:
             last_interrupt = now
             print()
             log_info("Opening OpenVPN Config Switcher...")
-            log_info(
-                "(Press Ctrl+C again quickly to stop all services instead)"
-            )
+            log_info("(Press Ctrl+C again quickly to stop everything)")
             print()
 
             try:
                 openvpn_switcher(supervisor_ref=self)
             except (KeyboardInterrupt, EOFError):
                 print()
-                log_info("Ctrl+C — shutting down all services...")
+                log_info("Shutting down all services...")
                 self.running = False
                 self.stop_all()
                 return
 
-            # After switcher exits, resume monitoring
+            # After switcher, resume monitoring
             log_success(
-                "Returned to service supervisor.\n"
+                "Returned to supervisor.\n"
                 "         Press Ctrl+C → OpenVPN Switcher\n"
-                "         Press Ctrl+C twice quickly → Stop everything"
+                "         Press Ctrl+C twice → Stop everything"
             )
 
-            # Re-enter the monitoring loop
-            try:
-                while self.running:
-                    time.sleep(10)
-
-                    if not is_vnc_running():
-                        log_warn("Health check: VNC is down!")
-                        self.ensure_vnc()
-                        time.sleep(3)
-
-                    if not is_port_open(6080):
-                        log_warn("Health check: NoVNC proxy is down!")
-                        self.ensure_novnc()
-                        time.sleep(2)
-
-                    if not self._is_cloudflared_alive():
-                        log_warn(
-                            "Health check: Cloudflare tunnel died — "
-                            "restarting..."
-                        )
-                        self.ensure_cloudflared()
-
-            except KeyboardInterrupt:
-                print()
-                log_info("Shutting down all services...")
-                self.running = False
-                self.stop_all()
+            # Re-enter monitoring
+            self._monitor_loop()
     # ── Graceful shutdown ─────────────────────────────────────────
     def stop_all(self) -> None:
         """Terminate cloudflared, NoVNC, and VNC in order."""
@@ -2549,12 +2607,13 @@ def main():
     #install_edge()
 
     # ── Step 4: Install VPN clients ──────────────────────────────
-    log_info("Step 4/6: Installing VPN clients...")
-    install_proton_vpn()
+    log_info("Step 4/9: Installing VPN clients...")
+    #install_proton_vpn()
     #install_windscribe()
-      # ── Step 5: OpenVPN setup ────────────────────────────────────
-    log_info("Step 5/9: OpenVPN setup...")
-    install_and_connect_openvpn()
+
+    # ── Step 5: Install OpenVPN (install only, do NOT connect yet)
+    log_info("Step 5/9: Installing OpenVPN...")
+    install_openvpn_only()
 
     # ── Step 6: Install Cloudflare tunnel ────────────────────────
     log_info("Step 6/9: Installing Cloudflare tunnel client...")
@@ -2568,13 +2627,14 @@ def main():
     log_info("Step 8/9: Optimizing desktop for low-latency VNC...")
     optimize_xfce_performance()
 
-    # ── Step 9: Launch and supervise all services ────────────────
+    # ── Step 9: Launch services, THEN connect OpenVPN ────────────
     print()
     log_info("Step 9/9: Starting desktop services...")
     print()
 
     supervisor = ServiceSupervisor(vnc_password, novnc_dir)
     supervisor.run()
+
 
 # ══════════════════════════════════════════════════════════════════
 # SCRIPT ENTRY
