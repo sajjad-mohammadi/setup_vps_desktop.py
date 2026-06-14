@@ -29,7 +29,7 @@ import platform
 import shutil
 import random
 import string
-
+from typing import Optional
 
 # ══════════════════════════════════════════════════════════════════
 # 1. TERMINAL COLOURS
@@ -741,7 +741,7 @@ def install_cloudflared() -> None:
 # ══════════════════════════════════════════════════════════════════
 # 13. VNC HELPERS
 # ══════════════════════════════════════════════════════════════════
-def find_novnc_dir() -> str | None:
+def find_novnc_dir() -> Optional[str]:
     """Return the first existing NoVNC web-root directory."""
     candidates = [
         "/usr/share/novnc",
