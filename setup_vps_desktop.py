@@ -2,7 +2,12 @@
 """
 VPS Desktop Setup & VPN Installer with Cloudflare Tunnel
 --------------------------------------------------------
-Fixed version - resolves VNC xstartup early exit issue.
+Fixed version:
+  - Detects Debian vs Ubuntu and installs Firefox correctly on each
+  - Removes stale/failed PPAs before they poison apt
+  - Fixes Proton VPN .deb download
+  - Fixes Windscribe TLS issue on Debian Bullseye
+  - Fixes xstartup early-exit VNC bug
 """
 
 import os
@@ -34,10 +39,10 @@ class Colors:
     UNDERLINE = '\033[4m'
 
 
-def log_info(msg):    print(f"{Colors.OKBLUE}[*] {msg}{Colors.ENDC}")
-def log_success(msg): print(f"{Colors.OKGREEN}[+] {msg}{Colors.ENDC}")
-def log_warn(msg):    print(f"{Colors.WARNING}[!] {msg}{Colors.ENDC}")
-def log_err(msg):     print(f"{Colors.FAIL}[-] {msg}{Colors.ENDC}")
+def log_info(msg):    print(f"{Colors.OKBLUE}[*] {msg}{Colors.ENDC}", flush=True)
+def log_success(msg): print(f"{Colors.OKGREEN}[+] {msg}{Colors.ENDC}", flush=True)
+def log_warn(msg):    print(f"{Colors.WARNING}[!] {msg}{Colors.ENDC}", flush=True)
+def log_err(msg):     print(f"{Colors.FAIL}[-] {msg}{Colors.ENDC}", flush=True)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -64,10 +69,48 @@ def generate_password(length=8):
 
 
 # ──────────────────────────────────────────────────────────────────
+# OS Detection helpers  ← NEW
+# ──────────────────────────────────────────────────────────────────
+def get_os_info():
+    """
+    Returns a dict with keys:
+      'id'       → 'debian' | 'ubuntu' | 'linuxmint' | ...
+      'codename' → e.g. 'bullseye', 'jammy', 'focal'
+      'version'  → e.g. '11', '22.04'
+    """
+    info = {'id': 'unknown', 'codename': 'unknown', 'version': 'unknown'}
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('ID='):
+                    info['id'] = line.split('=', 1)[1].strip('"').lower()
+                elif line.startswith('VERSION_CODENAME='):
+                    info['codename'] = line.split('=', 1)[1].strip('"').lower()
+                elif line.startswith('VERSION_ID='):
+                    info['version'] = line.split('=', 1)[1].strip('"').lower()
+    except Exception:
+        pass
+
+    # Fallback via lsb_release
+    if info['codename'] == 'unknown':
+        try:
+            info['codename'] = subprocess.check_output(
+                ['lsb_release', '-sc'], text=True
+            ).strip().lower()
+        except Exception:
+            pass
+    return info
+
+
+OS_INFO = {}   # populated in main()
+
+
+# ──────────────────────────────────────────────────────────────────
 # Command helpers
 # ──────────────────────────────────────────────────────────────────
 def run_cmd(cmd, shell=True, check=True):
-    """Run command, return stdout as string."""
+    """Run command silently, return stdout string."""
     result = subprocess.run(
         cmd, shell=shell, check=check,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -76,7 +119,7 @@ def run_cmd(cmd, shell=True, check=True):
 
 
 def run_cmd_live(cmd):
-    """Run command and stream output to console."""
+    """Run command and stream output to console in real time."""
     process = subprocess.Popen(
         cmd, shell=True,
         stdout=subprocess.PIPE,
@@ -84,14 +127,46 @@ def run_cmd_live(cmd):
         text=True
     )
     for line in iter(process.stdout.readline, ''):
-        print(line, end='')
+        print(line, end='', flush=True)
     process.wait()
     if process.returncode != 0:
         raise subprocess.CalledProcessError(process.returncode, cmd)
 
 
 # ──────────────────────────────────────────────────────────────────
-# Installation functions
+# APT repo hygiene helper  ← NEW
+# ──────────────────────────────────────────────────────────────────
+def remove_apt_source(filename):
+    """
+    Remove a sources.list.d file so a broken repo cannot
+    poison subsequent 'apt-get update' calls.
+    """
+    path = f"/etc/apt/sources.list.d/{filename}"
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+            log_info(f"Removed stale apt source: {path}")
+        except Exception as e:
+            log_warn(f"Could not remove {path}: {e}")
+
+
+def safe_apt_update():
+    """
+    Run apt-get update; if it fails only log a warning
+    instead of raising – callers decide how to proceed.
+    Returns True on success, False on failure.
+    """
+    try:
+        run_cmd_live("apt-get update -y")
+        return True
+    except subprocess.CalledProcessError as e:
+        log_warn(f"apt-get update finished with errors (exit {e.returncode}). "
+                 "Some repos may be unavailable – continuing anyway.")
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────
+# System dependencies
 # ──────────────────────────────────────────────────────────────────
 def install_system_dependencies():
     log_info("Updating apt package index...")
@@ -99,34 +174,21 @@ def install_system_dependencies():
 
     log_info("Installing desktop environment and VNC stack...")
     packages = [
-        # XFCE desktop (full)
-        "xfce4",
-        "xfce4-goodies",
-        "xfce4-session",          # session manager – critical for VNC
-        "xfwm4",                  # window manager
-        "xfdesktop4",             # desktop/wallpaper
-        # D-Bus (required for XFCE to start properly)
-        "dbus",
-        "dbus-x11",
-        # X11 utilities (xsetroot, xrdb etc.)
-        "x11-xserver-utils",
-        "x11-utils",
-        # NoVNC web proxy
-        "novnc",
-        "websockify",
-        # General utilities
-        "curl",
-        "wget",
-        "gnupg",
+        "xfce4", "xfce4-goodies", "xfce4-session",
+        "xfwm4", "xfdesktop4",
+        "dbus", "dbus-x11",
+        "x11-xserver-utils", "x11-utils",
+        "novnc", "websockify",
+        "curl", "wget", "gnupg",
         "software-properties-common",
-        "lsb-release",
-        "psmisc",                 # provides fuser / killall
-        "net-tools",
+        "lsb-release", "psmisc", "net-tools",
+        "ca-certificates",          # needed for TLS on older Debian
+        "apt-transport-https",
     ]
     cmd = f"DEBIAN_FRONTEND=noninteractive apt-get install -y {' '.join(packages)}"
     run_cmd_live(cmd)
 
-    # TigerVNC preferred; TightVNC as fallback
+    # TigerVNC preferred; TightVNC fallback
     try:
         log_info("Installing tigervnc-standalone-server...")
         run_cmd_live(
@@ -141,55 +203,204 @@ def install_system_dependencies():
         )
 
 
+# ──────────────────────────────────────────────────────────────────
+# Firefox  ← fully rewritten to handle Debian vs Ubuntu correctly
+# ──────────────────────────────────────────────────────────────────
 def install_firefox():
-    log_info("Installing Firefox (non-snap PPA method)...")
+    """
+    Install Firefox using the best method for the detected OS:
+
+    • Ubuntu  → Mozilla Team PPA (non-snap)
+    • Debian  → Mozilla's official .deb repo (packages.mozilla.org)
+                because Launchpad PPAs are Ubuntu-only.
+
+    If both targeted methods fail we fall back to whatever
+    the distro ships (e.g. firefox-esr on Debian).
+    """
+    os_id       = OS_INFO.get('id', 'unknown')
+    codename    = OS_INFO.get('codename', 'unknown')
+
+    log_info(f"Installing Firefox (OS: {os_id}, codename: {codename})...")
+
+    if os_id == 'ubuntu':
+        _install_firefox_ubuntu_ppa(codename)
+    else:
+        # Debian, LinuxMint-debian-edition, Raspbian, etc.
+        _install_firefox_debian_mozilla_repo(codename)
+
+
+def _install_firefox_ubuntu_ppa(codename):
+    """Mozilla Team PPA — works only on Ubuntu."""
+    ppa_list = "/etc/apt/sources.list.d/mozillateam-ubuntu-ppa-*.list"
     try:
+        log_info("Adding Mozilla Team PPA (Ubuntu)...")
         run_cmd_live("add-apt-repository -y ppa:mozillateam/ppa")
 
+        # Pinning so the PPA beats snap
         pinning = (
             "Package: firefox*\n"
             "Pin: release o=LP-PPA-mozillateam\n"
             "Pin-Priority: 1001\n"
         )
-        pin_path = "/etc/apt/preferences.d/mozilla-firefox"
-        with open(pin_path, "w") as f:
+        with open("/etc/apt/preferences.d/mozilla-firefox", "w") as f:
             f.write(pinning)
 
         run_cmd_live("apt-get update -y")
-        run_cmd_live("DEBIAN_FRONTEND=noninteractive apt-get install -y firefox")
-        log_success("Firefox installed.")
-    except Exception as e:
-        log_warn(f"PPA method failed ({e}), trying standard apt...")
-        try:
-            run_cmd_live("DEBIAN_FRONTEND=noninteractive apt-get install -y firefox")
-            log_success("Firefox installed via standard apt.")
-        except Exception as e2:
-            log_err(f"Firefox installation failed: {e2}")
-
-
-def install_edge():
-    log_info("Installing Microsoft Edge...")
-    try:
         run_cmd_live(
-            "curl -fSsL https://packages.microsoft.com/keys/microsoft.asc "
-            "| gpg --dearmor "
-            "| tee /usr/share/keyrings/microsoft-edge.gpg > /dev/null"
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y firefox"
         )
-        repo = (
-            "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-edge.gpg] "
-            "https://packages.microsoft.com/repos/edge stable main"
-        )
-        with open("/etc/apt/sources.list.d/microsoft-edge.list", "w") as f:
-            f.write(repo + "\n")
+        log_success("Firefox installed via Mozilla PPA.")
+    except Exception as e:
+        log_warn(f"Mozilla PPA method failed: {e}")
+        # ── Clean up the broken PPA so it doesn't poison future updates ──
+        _purge_mozilla_ppa()
+        log_warn("Falling back to default Ubuntu firefox package...")
+        try:
+            run_cmd_live("apt-get update -y")
+            run_cmd_live(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y firefox"
+            )
+            log_success("Firefox installed via standard Ubuntu apt.")
+        except Exception as e2:
+            log_err(f"Firefox installation failed entirely: {e2}")
 
+
+def _purge_mozilla_ppa():
+    """
+    Remove every trace of the Mozilla Launchpad PPA from apt sources
+    so subsequent 'apt-get update' calls succeed.
+    """
+    import glob
+    patterns = [
+        "/etc/apt/sources.list.d/mozillateam*",
+        "/etc/apt/sources.list.d/*mozilla*",
+        "/etc/apt/sources.list.d/*firefox*",
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+                log_info(f"Purged stale PPA source: {path}")
+            except Exception as ex:
+                log_warn(f"Could not purge {path}: {ex}")
+
+    # Also try ppa-purge if available
+    if shutil.which("ppa-purge"):
+        try:
+            run_cmd_live("ppa-purge -y ppa:mozillateam/ppa")
+        except Exception:
+            pass
+
+
+def _install_firefox_debian_mozilla_repo(codename):
+    """
+    Use Mozilla's official Debian repository (packages.mozilla.org).
+    This is the recommended non-snap Firefox method for Debian.
+    Ref: https://support.mozilla.org/en-US/kb/install-firefox-linux
+    """
+    log_info("Setting up Mozilla's official apt repo for Debian...")
+
+    keyring_path = "/usr/share/keyrings/mozilla-firefox.gpg"
+    source_path  = "/etc/apt/sources.list.d/mozilla-firefox.list"
+    pin_path     = "/etc/apt/preferences.d/mozilla-firefox"
+
+    try:
+        # 1. Import Mozilla's GPG key (modern signed-by method)
+        log_info("Importing Mozilla GPG key...")
+        run_cmd_live(
+            "curl -fSsL https://packages.mozilla.org/apt/repo-signing-key.gpg "
+            f"| gpg --dearmor -o {keyring_path}"
+        )
+        os.chmod(keyring_path, 0o644)
+
+        # 2. Add the Mozilla apt repository
+        repo_line = (
+            f"deb [signed-by={keyring_path}] "
+            "https://packages.mozilla.org/apt mozilla main"
+        )
+        with open(source_path, "w") as f:
+            f.write(repo_line + "\n")
+
+        # 3. Pin Mozilla repo to beat any distro-provided firefox-esr
+        pinning = (
+            "Package: *\n"
+            "Pin: origin packages.mozilla.org\n"
+            "Pin-Priority: 1001\n"
+        )
+        with open(pin_path, "w") as f:
+            f.write(pinning)
+
+        # 4. Update and install
         run_cmd_live("apt-get update -y")
         run_cmd_live(
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y microsoft-edge-stable"
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y firefox"
+        )
+        log_success("Firefox installed via packages.mozilla.org (Debian).")
+
+    except Exception as e:
+        log_warn(f"Mozilla repo method failed: {e}")
+        # Clean up so apt is not left broken
+        for path in [source_path, keyring_path, pin_path]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+        # Final fallback: firefox-esr (always available on Debian)
+        log_warn("Falling back to firefox-esr (Debian default)...")
+        try:
+            safe_apt_update()
+            run_cmd_live(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y firefox-esr"
+            )
+            log_success("firefox-esr installed as fallback.")
+        except Exception as e2:
+            log_err(f"firefox-esr installation also failed: {e2}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Microsoft Edge  ← fixed: apt update failure no longer fatal
+# ──────────────────────────────────────────────────────────────────
+def install_edge():
+    log_info("Installing Microsoft Edge...")
+    keyring = "/usr/share/keyrings/microsoft-edge.gpg"
+    source  = "/etc/apt/sources.list.d/microsoft-edge.list"
+    try:
+        # Import key
+        run_cmd_live(
+            "curl -fSsL https://packages.microsoft.com/keys/microsoft.asc "
+            f"| gpg --dearmor -o {keyring}"
+        )
+        os.chmod(keyring, 0o644)
+
+        # Add repo
+        repo = (
+            f"deb [arch=amd64 signed-by={keyring}] "
+            "https://packages.microsoft.com/repos/edge stable main"
+        )
+        with open(source, "w") as f:
+            f.write(repo + "\n")
+
+        # ── Use safe_apt_update so a broken unrelated repo (e.g. leftover
+        #    Mozilla PPA) does NOT abort the Edge installation ──
+        safe_apt_update()
+
+        run_cmd_live(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            "microsoft-edge-stable"
         )
         log_success("Microsoft Edge installed.")
         patch_edge_for_root()
     except Exception as e:
         log_err(f"Microsoft Edge installation failed: {e}")
+        # Clean up broken sources so later apt calls work
+        for path in [source, keyring]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 
 def patch_edge_for_root():
@@ -210,63 +421,218 @@ def patch_edge_for_root():
         log_success("Edge patched for root.")
     except Exception as e:
         log_err(f"Edge patch failed: {e}")
-
-
+# ──────────────────────────────────────────────────────────────────
+# Proton VPN  ← fixed: correct .deb URLs + Debian-aware install
+# ──────────────────────────────────────────────────────────────────
 def install_proton_vpn():
     log_info("Installing Proton VPN...")
+
+    os_id    = OS_INFO.get('id', 'unknown')
+    codename = OS_INFO.get('codename', 'unknown')
+
+    # ── Debian: use the official Proton debian repo directly ──────
+    if os_id == 'debian':
+        _install_protonvpn_debian(codename)
+    else:
+        _install_protonvpn_deb_package()
+
+
+def _install_protonvpn_debian(codename):
+    """
+    Install Proton VPN on Debian using their official apt repository.
+    Ref: https://protonvpn.com/support/linux-ubuntu-vpn-setup/
+    """
+    keyring = "/usr/share/keyrings/protonvpn.gpg"
+    source  = "/etc/apt/sources.list.d/protonvpn.list"
+    try:
+        log_info("Adding Proton VPN official Debian repository...")
+
+        # Import GPG key
+        run_cmd_live(
+            "curl -fSsL https://repo.protonvpn.com/debian/public_key.asc "
+            f"| gpg --dearmor -o {keyring}"
+        )
+        os.chmod(keyring, 0o644)
+
+        # Add repo (Proton uses 'stable' regardless of Debian codename)
+        repo = (
+            f"deb [signed-by={keyring}] "
+            "https://repo.protonvpn.com/debian stable main"
+        )
+        with open(source, "w") as f:
+            f.write(repo + "\n")
+
+        safe_apt_update()
+
+        run_cmd_live(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            "proton-vpn-gnome-desktop"
+        )
+        log_success("Proton VPN (GNOME desktop client) installed on Debian.")
+
+    except Exception as e:
+        log_warn(f"Proton VPN Debian repo method failed: {e}")
+        # Clean up
+        for path in [source, keyring]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        log_warn("Trying Proton VPN CLI fallback for Debian...")
+        _install_protonvpn_cli_pip()
+
+
+def _install_protonvpn_deb_package():
+    """
+    Ubuntu / generic: try downloading the release .deb that sets up
+    Proton's apt repo, then install protonvpn.
+    """
+    # Updated URL list — Proton keeps renaming these
     urls = [
-        "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.3-1_all.deb",
+        # Official page redirector (most reliable)
+        "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.3-3_all.deb",
         "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.3-2_all.deb",
-        "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.4_all.deb",
+        "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.3-1_all.deb",
     ]
+
     dest = "/tmp/protonvpn-release.deb"
     downloaded = False
+
     for url in urls:
         try:
             log_info(f"Trying: {url}")
             urllib.request.urlretrieve(url, dest)
             downloaded = True
+            log_success(f"Downloaded from: {url}")
             break
-        except Exception:
-            continue
-
-    if downloaded:
-        try:
-            run_cmd_live(f"dpkg -i {dest}")
-            run_cmd_live("apt-get update -y")
-            run_cmd_live("DEBIAN_FRONTEND=noninteractive apt-get install -y protonvpn")
-            log_success("Proton VPN installed.")
         except Exception as e:
-            log_err(f"Proton VPN install error: {e}")
-    else:
-        log_err("Could not download Proton VPN .deb – skipping.")
+            log_warn(f"  → failed ({e})")
+
+    if not downloaded:
+        log_warn("All Proton VPN .deb URLs failed – trying CLI via pip...")
+        _install_protonvpn_cli_pip()
+        return
+
+    try:
+        run_cmd_live(f"dpkg -i {dest}")
+        safe_apt_update()
+        run_cmd_live(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y protonvpn"
+        )
+        log_success("Proton VPN installed.")
+    except Exception as e:
+        log_err(f"Proton VPN install error: {e}")
+        _install_protonvpn_cli_pip()
 
 
+def _install_protonvpn_cli_pip():
+    """
+    Last-resort: install the Proton VPN Linux CLI via pip3.
+    Works on both Debian and Ubuntu without any apt repo.
+    """
+    log_info("Installing Proton VPN CLI via pip3 (fallback)...")
+    try:
+        # Ensure pip3 is available
+        run_cmd_live(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip"
+        )
+        run_cmd_live("pip3 install protonvpn-cli")
+        log_success("Proton VPN CLI installed via pip3.")
+        log_info(
+            "Usage: protonvpn-cli login <username>  "
+            "then  protonvpn-cli connect"
+        )
+    except Exception as e:
+        log_err(f"Proton VPN pip3 install also failed: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Windscribe  ← fixed: TLS issue on Debian + stale repo cleanup
+# ──────────────────────────────────────────────────────────────────
 def install_windscribe():
     log_info("Installing Windscribe VPN CLI...")
+
+    os_id    = OS_INFO.get('id', 'unknown')
+    codename = OS_INFO.get('codename', 'unknown')
+
+    keyring = "/usr/share/keyrings/windscribe-archive-keyring.gpg"
+    source  = "/etc/apt/sources.list.d/windscribe.list"
+
+    # Windscribe only publishes Ubuntu codename repos.
+    # Map Debian codenames → closest Ubuntu equivalent.
+    debian_to_ubuntu = {
+        'buster':   'bionic',
+        'bullseye': 'focal',
+        'bookworm': 'jammy',
+        'trixie':   'noble',
+    }
+
+    if os_id == 'debian':
+        repo_codename = debian_to_ubuntu.get(codename, 'focal')
+        log_info(
+            f"Debian '{codename}' detected – "
+            f"using Ubuntu '{repo_codename}' Windscribe repo."
+        )
+    else:
+        repo_codename = codename   # Ubuntu: use directly
+
     try:
+        # ── Fix TLS issue on Debian Bullseye: update ca-certificates first ──
+        log_info("Ensuring ca-certificates is up-to-date...")
         run_cmd_live(
-            "curl -s https://assets.windscribe.com/keys/windscribe.gpg "
-            "| gpg --dearmor "
-            "| tee /usr/share/keyrings/windscribe-archive-keyring.gpg > /dev/null"
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            "--only-upgrade ca-certificates || true"
         )
-        codename = run_cmd("lsb_release -sc").strip()
+        run_cmd_live("update-ca-certificates --fresh || true")
+
+        # Import Windscribe GPG key
+        log_info("Importing Windscribe GPG key...")
+        run_cmd_live(
+            "curl -fSsL https://assets.windscribe.com/keys/windscribe.gpg "
+            f"| gpg --dearmor -o {keyring}"
+        )
+        os.chmod(keyring, 0o644)
+
+        # Add Windscribe repository
         repo = (
-            f"deb [signed-by=/usr/share/keyrings/windscribe-archive-keyring.gpg] "
-            f"https://repo.windscribe.com/ubuntu {codename} main"
+            f"deb [signed-by={keyring}] "
+            f"https://repo.windscribe.com/ubuntu {repo_codename} main"
         )
-        with open("/etc/apt/sources.list.d/windscribe.list", "w") as f:
+        with open(source, "w") as f:
             f.write(repo + "\n")
 
-        run_cmd_live("apt-get update -y")
+        # Use safe_apt_update: don't abort if another repo is broken
+        ok = safe_apt_update()
+        if not ok:
+            log_warn(
+                "apt-get update had errors but we will still try "
+                "to install windscribe-cli..."
+            )
+
         run_cmd_live(
             "DEBIAN_FRONTEND=noninteractive apt-get install -y windscribe-cli"
         )
         log_success("Windscribe CLI installed.")
+
     except Exception as e:
         log_err(f"Windscribe install failed: {e}")
+        # Clean up so broken repo doesn't affect future apt calls
+        for path in [source, keyring]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        log_warn(
+            "Windscribe could not be installed automatically.\n"
+            "  Manual install: https://windscribe.com/guides/linux"
+        )
 
 
+# ──────────────────────────────────────────────────────────────────
+# Cloudflared
+# ──────────────────────────────────────────────────────────────────
 def install_cloudflared():
     dest = "/usr/local/bin/cloudflared"
     if os.path.exists(dest):
@@ -275,6 +641,7 @@ def install_cloudflared():
 
     log_info("Installing Cloudflare Tunnel (cloudflared)...")
     machine = platform.machine().lower()
+
     if "aarch64" in machine or "arm64" in machine:
         url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
     elif "arm" in machine:
@@ -285,7 +652,7 @@ def install_cloudflared():
         url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386"
 
     try:
-        log_info(f"Downloading cloudflared ({machine})...")
+        log_info(f"Downloading cloudflared for arch '{machine}'...")
         urllib.request.urlretrieve(url, dest)
         os.chmod(dest, 0o755)
         log_success("cloudflared installed.")
@@ -333,14 +700,12 @@ def stop_existing_vnc():
     """Kill any VNC session on :1 and remove stale lock files."""
     log_info("Cleaning up any existing VNC server on display :1...")
 
-    # Graceful vncserver kill
     subprocess.run(
         ['vncserver', '-kill', ':1'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     time.sleep(1)
 
-    # Force-kill any Xtigervnc / Xtightvnc remnants
     for name in ['Xtigervnc', 'Xtightvnc', 'Xvnc']:
         subprocess.run(
             ['pkill', '-f', name],
@@ -348,7 +713,6 @@ def stop_existing_vnc():
         )
     time.sleep(1)
 
-    # Remove stale lock / socket files
     for path in ["/tmp/.X1-lock", "/tmp/.X11-unix/X1"]:
         if os.path.exists(path):
             try:
@@ -369,7 +733,9 @@ def start_vnc(vnc_password):
     passwd_path = os.path.join(vnc_dir, "passwd")
     proc = subprocess.Popen(
         ['vncpasswd', '-f'],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
     )
     stdout, _ = proc.communicate(
         input=f"{vnc_password}\n{vnc_password}\n".encode()
@@ -379,32 +745,31 @@ def start_vnc(vnc_password):
     os.chmod(passwd_path, 0o600)
 
     # ── Write xstartup ───────────────────────────────────────────
-    # THE FIX: exec in foreground (no trailing &) so VNC session
-    # does NOT exit immediately.  dbus-launch provides the D-Bus
-    # session that XFCE4 requires.
+    # CRITICAL: exec in foreground (no trailing &) so the VNC
+    # session does NOT exit immediately after launch.
     xstartup_path = os.path.join(vnc_dir, "xstartup")
     xstartup_content = """#!/bin/sh
-# Unset any inherited session vars that confuse XFCE
+# Unset vars that confuse XFCE inside VNC
 unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
 
 # Load X resources if present
 [ -r "$HOME/.Xresources" ] && xrdb "$HOME/.Xresources"
 
-# Background helpers
+# Background helpers (these are fine in background)
 xsetroot -solid grey &
 vncconfig -iconic &
 
-# ── Run XFCE4 in the FOREGROUND via dbus-launch ──────────────────
-# This line MUST be last and MUST NOT have a trailing '&'.
+# ── XFCE4 must run in the FOREGROUND (no trailing '&') ───────────
 # VNC keeps the session alive as long as this process runs.
+# dbus-launch provides the D-Bus session XFCE requires.
 exec dbus-launch --exit-with-session startxfce4
 """
     with open(xstartup_path, "w") as f:
         f.write(xstartup_content)
     os.chmod(xstartup_path, 0o755)
 
-    # ── Clean slate before starting ──────────────────────────────
+    # ── Clean slate ──────────────────────────────────────────────
     stop_existing_vnc()
 
     log_info("Starting VNC server on display :1 (1920x1080)...")
@@ -419,7 +784,7 @@ exec dbus-launch --exit-with-session startxfce4
         log_err(f"vncserver stderr:\n{result.stderr}")
         raise subprocess.CalledProcessError(result.returncode, cmd)
 
-    # ── Wait for port 5901 to become reachable ───────────────────
+    # ── Wait for port 5901 ───────────────────────────────────────
     log_info("Waiting for VNC to bind port 5901...")
     for attempt in range(15):
         time.sleep(1)
@@ -429,24 +794,27 @@ exec dbus-launch --exit-with-session startxfce4
         log_info(f"  attempt {attempt + 1}/15 ...")
 
     raise RuntimeError(
-        "VNC server process started but port 5901 never became reachable.\n"
-        f"Check ~/.vnc/ logs for details."
+        "VNC started but port 5901 never became reachable. "
+        "Check ~/.vnc/ logs for details."
     )
 
 
 # ──────────────────────────────────────────────────────────────────
-# NoVNC helper
+# NoVNC proxy
 # ──────────────────────────────────────────────────────────────────
 def start_novnc(novnc_dir):
-    log_info(f"Starting NoVNC proxy (port 6080 → 5901) using: {novnc_dir}")
-    # Free port 6080 if occupied
+    log_info(f"Starting NoVNC proxy (port 6080 → 5901), webroot: {novnc_dir}")
     subprocess.run(
         "fuser -k 6080/tcp", shell=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     time.sleep(1)
     cmd = ['websockify', '--web', novnc_dir, '6080', 'localhost:5901']
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
     log_success("NoVNC proxy launched.")
     return proc
 
@@ -456,13 +824,13 @@ def start_novnc(novnc_dir):
 # ──────────────────────────────────────────────────────────────────
 class ServiceSupervisor:
     def __init__(self, vnc_password: str, novnc_dir: str):
-        self.vnc_password      = vnc_password
-        self.novnc_dir         = novnc_dir
-        self.cloudflared_proc  = None
-        self.novnc_proc        = None
-        self.tunnel_url        = None
-        self.url_event         = threading.Event()
-        self.running           = True
+        self.vnc_password     = vnc_password
+        self.novnc_dir        = novnc_dir
+        self.cloudflared_proc = None
+        self.novnc_proc       = None
+        self.tunnel_url       = None
+        self.url_event        = threading.Event()
+        self.running          = True
 
     # ── VNC ───────────────────────────────────────────────────────
     def start_vnc_server(self):
@@ -486,10 +854,13 @@ class ServiceSupervisor:
 
     # ── Cloudflare ────────────────────────────────────────────────
     def _watch_cloudflared_stderr(self, proc):
+        """Background thread: scan cloudflared output for tunnel URL."""
         for line in iter(proc.stderr.readline, ''):
             if not self.running:
                 break
-            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+            match = re.search(
+                r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line
+            )
             if match:
                 self.tunnel_url = match.group(0)
                 self.url_event.set()
@@ -498,7 +869,8 @@ class ServiceSupervisor:
         if not is_port_open(6080):
             log_warn("NoVNC not ready; skipping cloudflared start.")
             return
-        if self.cloudflared_proc and self.cloudflared_proc.poll() is None:
+        if (self.cloudflared_proc
+                and self.cloudflared_proc.poll() is None):
             return  # already running
 
         log_info("Starting Cloudflare quick tunnel...")
@@ -519,16 +891,32 @@ class ServiceSupervisor:
         log_info("Waiting up to 35 s for Cloudflare to assign a domain...")
         if self.url_event.wait(timeout=35):
             C = Colors
-            print(f"\n{C.OKCYAN}{'=' * 66}{C.ENDC}")
+            sep = '=' * 66
+            print(f"\n{C.OKCYAN}{sep}{C.ENDC}")
             print(f"🚀  {C.BOLD}{C.OKGREEN}VPS DESKTOP IS READY!{C.ENDC}")
-            print(f"{'=' * 66}")
-            print(f"🔗  {C.BOLD}Web Link :{C.ENDC}  {C.UNDERLINE}{C.OKGREEN}{self.tunnel_url}{C.ENDC}")
-            print(f"🔑  {C.BOLD}VNC Pass :{C.ENDC}  {C.WARNING}{self.vnc_password}{C.ENDC}")
-            print(f"{'=' * 66}\n")
+            print(f"{C.OKCYAN}{sep}{C.ENDC}")
+            print(
+                f"🔗  {C.BOLD}Web Link :{C.ENDC}  "
+                f"{C.UNDERLINE}{C.OKGREEN}{self.tunnel_url}{C.ENDC}"
+            )
+            print(
+                f"🔑  {C.BOLD}VNC Pass :{C.ENDC}  "
+                f"{C.WARNING}{self.vnc_password}{C.ENDC}"
+            )
+            print(f"{C.OKCYAN}{sep}{C.ENDC}")
+            print(
+                f"\n{C.BOLD}💡 Tip:{C.ENDC} When Windscribe or Proton VPN "
+                "is active, all VPS traffic routes through the VPN.\n"
+                "   The Cloudflare Tunnel keeps your browser session "
+                "alive — it will NOT disconnect when VPN connects!\n"
+            )
         else:
-            log_err("Cloudflare tunnel timed out – no URL received.")
+            log_err(
+                "Cloudflare tunnel timed out – no URL received.\n"
+                "  Check: cloudflared tunnel --url http://127.0.0.1:6080"
+            )
 
-    # ── Main loop ─────────────────────────────────────────────────
+    # ── Main supervisor loop ──────────────────────────────────────
     def run(self):
         log_info("Starting Service Supervisor...")
 
@@ -542,18 +930,23 @@ class ServiceSupervisor:
         try:
             while self.running:
                 time.sleep(10)
+
                 if not is_vnc_running():
                     self.start_vnc_server()
                     time.sleep(3)
+
                 if not is_port_open(6080):
                     self.start_novnc_proxy()
                     time.sleep(2)
-                if self.cloudflared_proc is None or self.cloudflared_proc.poll() is not None:
+
+                if (self.cloudflared_proc is None
+                        or self.cloudflared_proc.poll() is not None):
                     log_warn("Cloudflare tunnel died – restarting...")
                     self.start_cloudflared_tunnel()
+
         except KeyboardInterrupt:
             print()
-            log_info("Shutting down...")
+            log_info("Shutting down all services...")
             self.running = False
             self.stop_all()
 
@@ -565,37 +958,57 @@ class ServiceSupervisor:
                 except Exception:
                     pass
         stop_existing_vnc()
-        log_success("All services stopped.")
+        log_success("All services stopped. Goodbye!")
 
 
 # ──────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────
 def main():
+    global OS_INFO
+
     C = Colors
-    print(f"\n{C.HEADER}{'=' * 66}{C.ENDC}")
+    sep = '=' * 66
+    print(f"\n{C.HEADER}{sep}{C.ENDC}")
     print(f"{C.BOLD}⚡  VPS NATIVE DESKTOP + VPN SETUP  (Fixed Edition){C.ENDC}")
-    print(f"{C.HEADER}{'=' * 66}{C.ENDC}\n")
+    print(f"{C.HEADER}{sep}{C.ENDC}\n")
 
     check_root()
     check_os()
 
-    vnc_password = sys.argv[1] if len(sys.argv) > 1 else generate_password()
-    log_info(f"VNC password: {vnc_password}")
+    # Detect OS early so all install functions can use it
+    OS_INFO = get_os_info()
+    log_info(
+        f"Detected OS: {OS_INFO['id']} "
+        f"(codename: {OS_INFO['codename']}, "
+        f"version: {OS_INFO['version']})"
+    )
 
+    vnc_password = sys.argv[1] if len(sys.argv) > 1 else generate_password()
+    log_info(f"VNC password for this session: {vnc_password}")
+
+    # ── Step 1: System packages ───────────────────────────────────
     install_system_dependencies()
 
+    # ── Step 2: Locate NoVNC ─────────────────────────────────────
     novnc_dir = find_novnc_dir()
     if not novnc_dir:
         log_err("NoVNC share directory not found after installation.")
         sys.exit(1)
+    log_success(f"NoVNC directory: {novnc_dir}")
 
+    # ── Step 3: Browsers ─────────────────────────────────────────
     install_firefox()
     install_edge()
+
+    # ── Step 4: VPNs ─────────────────────────────────────────────
     install_proton_vpn()
     install_windscribe()
+
+    # ── Step 5: Cloudflare tunnel binary ─────────────────────────
     install_cloudflared()
 
+    # ── Step 6: Start & supervise all services ───────────────────
     supervisor = ServiceSupervisor(vnc_password, novnc_dir)
     supervisor.run()
 
