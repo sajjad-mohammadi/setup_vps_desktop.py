@@ -1495,12 +1495,12 @@ def main():
     # ── Step 3: Install web browsers ─────────────────────────────
     log_info("Step 3/6: Installing web browsers...")
     install_firefox()
-    install_edge()
+    #install_edge()
 
     # ── Step 4: Install VPN clients ──────────────────────────────
     log_info("Step 4/6: Installing VPN clients...")
-    install_proton_vpn()
-    install_windscribe()
+    #install_proton_vpn()
+    #install_windscribe()
 
     # ── Step 5: Install Cloudflare tunnel ────────────────────────
     log_info("Step 5/7: Installing Cloudflare tunnel client...")
@@ -1518,13 +1518,6 @@ def main():
     # THESE ARE THE MISSING LINES:
     supervisor = ServiceSupervisor(vnc_password, novnc_dir)
     supervisor.run()
-
-# ══════════════════════════════════════════════════════════════════
-# SCRIPT ENTRY
-# ══════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    main()
-
 
 # ══════════════════════════════════════════════════════════════════
 # SCRIPT ENTRY
