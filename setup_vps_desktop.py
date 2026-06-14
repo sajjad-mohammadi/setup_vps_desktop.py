@@ -1274,6 +1274,451 @@ Categories=Network;VPN;
         log_info("  Created shortcut: openvpn.desktop")
     except Exception as exc:
         log_warn(f"  Failed to create OpenVPN shortcut: {exc}")
+
+# ══════════════════════════════════════════════════════════════════
+# OPENVPN CONFIG SWITCHER (interactive terminal menu)
+# ══════════════════════════════════════════════════════════════════
+def openvpn_switcher() -> None:
+    """
+    Interactive terminal menu that lets the user:
+      1. See current OpenVPN connection status
+      2. Switch between .ovpn config files
+      3. Disconnect from OpenVPN
+      4. Reconnect with new credentials
+      5. Exit the switcher
+
+    This runs in a loop until the user chooses to exit,
+    then the script continues to the next step.
+    """
+    import getpass
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    C = Colors
+    sep = '═' * 58
+    thin = '─' * 58
+
+    def get_vpn_status() -> dict:
+        """Check current OpenVPN connection status."""
+        status = {
+            'running': False,
+            'connected': False,
+            'vpn_ip': None,
+            'config': None,
+            'pid': None,
+        }
+
+        # Check if openvpn process is running
+        try:
+            result = subprocess.run(
+                ['pgrep', '-x', 'openvpn'],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                status['running'] = True
+                status['pid'] = result.stdout.strip().split('\n')[0]
+        except Exception:
+            pass
+
+        # Check tun0 interface for VPN IP
+        if status['running']:
+            try:
+                result = subprocess.run(
+                    ['ip', '-4', 'addr', 'show', 'tun0'],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    match = re.search(
+                        r'inet (\d+\.\d+\.\d+\.\d+)',
+                        result.stdout,
+                    )
+                    if match:
+                        status['connected'] = True
+                        status['vpn_ip'] = match.group(1)
+            except Exception:
+                pass
+
+        # Try to find which config is being used
+        if status['running'] and status['pid']:
+            try:
+                result = subprocess.run(
+                    ['ps', '-p', status['pid'], '-o', 'args='],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    match = re.search(
+                        r'--config\s+(\S+)',
+                        result.stdout,
+                    )
+                    if match:
+                        config_path = match.group(1)
+                        status['config'] = os.path.basename(config_path)
+            except Exception:
+                pass
+
+        return status
+
+    def find_ovpn_files() -> list:
+        """Find all .ovpn files in the script directory."""
+        return sorted(glob.glob(os.path.join(script_dir, "*.ovpn")))
+
+    def print_status(status: dict) -> None:
+        """Print current VPN status block."""
+        if status['connected']:
+            state_icon = "✅"
+            state_text = f"{C.OKGREEN}CONNECTED{C.ENDC}"
+        elif status['running']:
+            state_icon = "🔄"
+            state_text = f"{C.WARNING}CONNECTING...{C.ENDC}"
+        else:
+            state_icon = "❌"
+            state_text = f"{C.FAIL}DISCONNECTED{C.ENDC}"
+
+        print(f"\n  {state_icon}  Status : {state_text}")
+
+        if status['vpn_ip']:
+            print(f"  🌐  VPN IP : {C.OKGREEN}{status['vpn_ip']}{C.ENDC}")
+
+        if status['config']:
+            print(f"  📄  Config : {C.OKCYAN}{status['config']}{C.ENDC}")
+
+        if status['pid']:
+            print(f"  🔧  PID    : {status['pid']}")
+
+    def print_menu(ovpn_files: list, status: dict) -> None:
+        """Print the switcher menu."""
+        print(f"\n{C.OKCYAN}{sep}{C.ENDC}")
+        print(f"  {C.BOLD}🔄  OpenVPN Config Switcher{C.ENDC}")
+        print(f"{C.OKCYAN}{sep}{C.ENDC}")
+
+        print_status(status)
+
+        print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
+        print(f"  {C.BOLD}Available configs:{C.ENDC}")
+        print()
+
+        if not ovpn_files:
+            print(
+                f"  {C.FAIL}No .ovpn files found in:{C.ENDC}\n"
+                f"  {script_dir}"
+            )
+        else:
+            for i, f in enumerate(ovpn_files, 1):
+                fname = os.path.basename(f)
+                # Mark currently active config
+                if status['config'] and fname == status['config']:
+                    marker = f" {C.OKGREEN}◄ ACTIVE{C.ENDC}"
+                else:
+                    marker = ""
+                print(
+                    f"  {C.OKCYAN}[{i}]{C.ENDC} {fname}{marker}"
+                )
+
+        print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
+        print(f"  {C.BOLD}Actions:{C.ENDC}")
+        print()
+
+        if ovpn_files:
+            print(
+                f"  {C.WARNING}[1-{len(ovpn_files)}]{C.ENDC}"
+                f"  Connect to a config"
+            )
+
+        if status['running']:
+            print(f"  {C.WARNING}[D]{C.ENDC}      Disconnect VPN")
+            print(f"  {C.WARNING}[S]{C.ENDC}      Show connection log")
+
+        print(f"  {C.WARNING}[R]{C.ENDC}      Refresh status")
+        print(f"  {C.WARNING}[Q]{C.ENDC}      Quit switcher & continue")
+
+        print(f"{C.OKCYAN}{sep}{C.ENDC}")
+
+    def disconnect_vpn() -> None:
+        """Stop any running OpenVPN process."""
+        log_info("Disconnecting OpenVPN...")
+        subprocess.run(
+            ['killall', 'openvpn'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
+
+        # Verify disconnected
+        result = subprocess.run(
+            ['pgrep', '-x', 'openvpn'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            log_success("OpenVPN disconnected.")
+        else:
+            log_warn("OpenVPN may still be running. Trying force kill...")
+            subprocess.run(
+                ['killall', '-9', 'openvpn'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(1)
+            log_success("OpenVPN force-killed.")
+
+    def connect_vpn(ovpn_config: str) -> None:
+        """Connect to a specific .ovpn config with credentials."""
+        fname = os.path.basename(ovpn_config)
+
+        # Disconnect existing connection first
+        status = get_vpn_status()
+        if status['running']:
+            log_info("Disconnecting current VPN first...")
+            disconnect_vpn()
+
+        print()
+        log_info(f"Connecting to: {C.BOLD}{fname}{C.ENDC}")
+        print()
+
+        # Ask for credentials
+        try:
+            username = input(
+                f"  {C.OKCYAN}Username:{C.ENDC} "
+            ).strip()
+
+            if not username:
+                log_warn("Empty username — cancelled.")
+                return
+
+            password = getpass.getpass(
+                f"  {C.OKCYAN}Password:{C.ENDC} "
+            ).strip()
+
+            if not password:
+                log_warn("Empty password — cancelled.")
+                return
+
+        except (KeyboardInterrupt, EOFError):
+            print()
+            log_warn("Connection cancelled.")
+            return
+
+        # Write credentials to temp file
+        creds_file = "/tmp/.ovpn_credentials"
+        try:
+            with open(creds_file, "w") as fh:
+                fh.write(f"{username}\n{password}\n")
+            os.chmod(creds_file, 0o600)
+        except Exception as exc:
+            log_err(f"Failed to write credentials: {exc}")
+            return
+
+        # Patch config to use credentials file
+        patched_config = "/tmp/.ovpn_patched.ovpn"
+        try:
+            with open(ovpn_config, "r") as fh:
+                config_content = fh.read()
+
+            if "auth-user-pass" in config_content:
+                config_content = re.sub(
+                    r'^auth-user-pass.*$',
+                    f'auth-user-pass {creds_file}',
+                    config_content,
+                    flags=re.MULTILINE,
+                )
+            else:
+                config_content += f"\nauth-user-pass {creds_file}\n"
+
+            with open(patched_config, "w") as fh:
+                fh.write(config_content)
+            os.chmod(patched_config, 0o600)
+        except Exception as exc:
+            log_err(f"Failed to patch config: {exc}")
+            return
+
+        # Start OpenVPN
+        ovpn_log = "/tmp/openvpn.log"
+        try:
+            subprocess.Popen(
+                [
+                    'openvpn',
+                    '--config', patched_config,
+                    '--daemon',
+                    '--log', ovpn_log,
+                    '--writepid', '/tmp/openvpn.pid',
+                    '--connect-retry', '3',
+                    '--connect-retry-max', '5',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            log_err(f"Failed to launch OpenVPN: {exc}")
+            return
+
+        # Wait for connection
+        log_info("Waiting for connection (up to 30s)...")
+        connected = False
+
+        for attempt in range(1, 31):
+            time.sleep(1)
+
+            # Check process alive
+            alive = subprocess.run(
+                ['pgrep', '-x', 'openvpn'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+
+            if not alive:
+                log_err("OpenVPN process died!")
+                if os.path.exists(ovpn_log):
+                    try:
+                        with open(ovpn_log) as fh:
+                            lines = fh.readlines()
+                        log_err("Last 10 lines of log:")
+                        for line in lines[-10:]:
+                            print(
+                                f"  {C.FAIL}"
+                                f"{line.rstrip()}"
+                                f"{C.ENDC}"
+                            )
+                    except Exception:
+                        pass
+                break
+
+            # Check tun0
+            try:
+                result = subprocess.run(
+                    ['ip', 'addr', 'show', 'tun0'],
+                    capture_output=True, text=True,
+                )
+                if (result.returncode == 0
+                        and 'inet ' in result.stdout):
+                    connected = True
+                    break
+            except Exception:
+                pass
+
+            # Check log for success
+            if os.path.exists(ovpn_log):
+                try:
+                    with open(ovpn_log) as fh:
+                        log_text = fh.read()
+                    if "Initialization Sequence Completed" in log_text:
+                        connected = True
+                        break
+                except Exception:
+                    pass
+
+            if attempt % 5 == 0:
+                log_info(f"  Still connecting... {attempt}/30")
+
+        if connected:
+            new_status = get_vpn_status()
+            vpn_ip = new_status.get('vpn_ip', 'unknown')
+
+            print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
+            print(
+                f"  🔒  {C.BOLD}{C.OKGREEN}"
+                f"Connected to {fname}!{C.ENDC}"
+            )
+            print(f"  🌐  VPN IP: {C.OKGREEN}{vpn_ip}{C.ENDC}")
+            print(f"{C.OKCYAN}{thin}{C.ENDC}")
+        else:
+            log_err(
+                f"Connection failed or timed out.\n"
+                f"  Check log: cat {ovpn_log}"
+            )
+
+        # Remove credentials file
+        try:
+            if os.path.exists(creds_file):
+                os.remove(creds_file)
+        except Exception:
+            pass
+
+    def show_log() -> None:
+        """Show last 20 lines of OpenVPN log."""
+        ovpn_log = "/tmp/openvpn.log"
+        if not os.path.exists(ovpn_log):
+            log_warn("No OpenVPN log file found.")
+            return
+
+        print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
+        print(f"  {C.BOLD}📋  OpenVPN Log (last 20 lines):{C.ENDC}")
+        print(f"{C.OKCYAN}{thin}{C.ENDC}")
+
+        try:
+            with open(ovpn_log) as fh:
+                lines = fh.readlines()
+            for line in lines[-20:]:
+                print(f"  {line.rstrip()}")
+        except Exception as exc:
+            log_err(f"Could not read log: {exc}")
+
+        print(f"{C.OKCYAN}{thin}{C.ENDC}")
+
+    # ── Main menu loop ───────────────────────────────────────────
+    log_info("Starting OpenVPN Config Switcher...")
+
+    while True:
+        ovpn_files = find_ovpn_files()
+        status = get_vpn_status()
+
+        print_menu(ovpn_files, status)
+
+        try:
+            choice = input(
+                f"\n  {C.OKBLUE}[?] Your choice: {C.ENDC}"
+            ).strip().upper()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            log_info("Exiting OpenVPN switcher...")
+            break
+
+        if not choice:
+            continue
+
+        # Quit
+        if choice == 'Q':
+            log_info("Exiting OpenVPN switcher...")
+            break
+
+        # Disconnect
+        elif choice == 'D':
+            if status['running']:
+                disconnect_vpn()
+            else:
+                log_warn("OpenVPN is not running.")
+
+        # Show log
+        elif choice == 'S':
+            show_log()
+
+        # Refresh
+        elif choice == 'R':
+            log_info("Refreshing status...")
+            continue
+
+        # Connect to a config by number
+        elif choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(ovpn_files):
+                connect_vpn(ovpn_files[idx])
+            else:
+                log_warn(
+                    f"Invalid choice. "
+                    f"Enter 1-{len(ovpn_files)}."
+                )
+
+        else:
+            log_warn(
+                "Invalid input. Use a number, "
+                "D, S, R, or Q."
+            )
+
+        # Pause before refreshing menu
+        input(
+            f"\n  {C.WARNING}"
+            f"Press Enter to continue...{C.ENDC}"
+        )
+
+    print()
 # ══════════════════════════════════════════════════════════════════
 # 12. CLOUDFLARED
 # ══════════════════════════════════════════════════════════════════
@@ -1806,9 +2251,9 @@ class ServiceSupervisor:
     # ── Main supervisor loop ──────────────────────────────────────
     def run(self) -> None:
         """
-        Start all three services, then enter a monitoring loop
-        that restarts any service that dies.
-        Press Ctrl+C to shut everything down.
+        Start all three services, then enter a monitoring loop.
+        Press Ctrl+C once  → open OpenVPN Config Switcher
+        Press Ctrl+C twice → shut everything down
         """
         C = Colors
 
@@ -1830,11 +2275,13 @@ class ServiceSupervisor:
         print(f"{C.OKCYAN}{'─' * 66}{C.ENDC}")
         log_success(
             "Supervisor is actively monitoring all services.\n"
-            "         Press Ctrl+C to stop everything."
+            "         Press Ctrl+C → OpenVPN Switcher\n"
+            "         Press Ctrl+C twice quickly → Stop everything"
         )
         print(f"{C.OKCYAN}{'─' * 66}{C.ENDC}")
 
         # ── Monitoring loop ──────────────────────────────────────
+        last_interrupt = 0
         try:
             while self.running:
                 time.sleep(10)
@@ -1860,11 +2307,67 @@ class ServiceSupervisor:
                     self.ensure_cloudflared()
 
         except KeyboardInterrupt:
-            print()
-            log_info("Ctrl+C received — shutting down all services...")
-            self.running = False
-            self.stop_all()
+            now = time.time()
 
+            # Double Ctrl+C within 2 seconds → full shutdown
+            if now - last_interrupt < 2:
+                print()
+                log_info("Double Ctrl+C — shutting down all services...")
+                self.running = False
+                self.stop_all()
+                return
+
+            last_interrupt = now
+            print()
+            log_info("Opening OpenVPN Config Switcher...")
+            log_info(
+                "(Press Ctrl+C again quickly to stop all services instead)"
+            )
+            print()
+
+            try:
+                openvpn_switcher()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                log_info("Ctrl+C — shutting down all services...")
+                self.running = False
+                self.stop_all()
+                return
+
+            # After switcher exits, resume monitoring
+            log_success(
+                "Returned to service supervisor.\n"
+                "         Press Ctrl+C → OpenVPN Switcher\n"
+                "         Press Ctrl+C twice quickly → Stop everything"
+            )
+
+            # Re-enter the monitoring loop
+            try:
+                while self.running:
+                    time.sleep(10)
+
+                    if not is_vnc_running():
+                        log_warn("Health check: VNC is down!")
+                        self.ensure_vnc()
+                        time.sleep(3)
+
+                    if not is_port_open(6080):
+                        log_warn("Health check: NoVNC proxy is down!")
+                        self.ensure_novnc()
+                        time.sleep(2)
+
+                    if not self._is_cloudflared_alive():
+                        log_warn(
+                            "Health check: Cloudflare tunnel died — "
+                            "restarting..."
+                        )
+                        self.ensure_cloudflared()
+
+            except KeyboardInterrupt:
+                print()
+                log_info("Shutting down all services...")
+                self.running = False
+                self.stop_all()
     # ── Graceful shutdown ─────────────────────────────────────────
     def stop_all(self) -> None:
         """Terminate cloudflared, NoVNC, and VNC in order."""
@@ -1978,8 +2481,7 @@ def main():
     log_info("Step 4/6: Installing VPN clients...")
     install_proton_vpn()
     #install_windscribe()
-
-    # ── Step 5: OpenVPN setup ────────────────────────────────────
+      # ── Step 5: OpenVPN setup ────────────────────────────────────
     log_info("Step 5/9: OpenVPN setup...")
     install_and_connect_openvpn()
 
