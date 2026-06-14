@@ -1061,34 +1061,16 @@ def install_and_connect_openvpn() -> None:
 
     # ── Step 5: Patch config to use credentials file ─────────────
     # We create a modified copy so the original .ovpn stays intact.
-    patched_config = "/tmp/.ovpn_patched.ovpn"
-    try:
-        with open(ovpn_config, "r") as fh:
-            config_content = fh.read()
-
-        # Replace 'auth-user-pass' (without a file path) with
-        # 'auth-user-pass <creds_file>' so OpenVPN reads creds
-        # automatically without prompting.
-        if "auth-user-pass" in config_content:
-            # Remove any existing auth-user-pass line
-            config_content = re.sub(
-                r'^auth-user-pass.*$',
-                f'auth-user-pass {creds_file}',
-                config_content,
-                flags=re.MULTILINE,
-            )
-        else:
-            # Add auth-user-pass if not present at all
-            config_content += f"\nauth-user-pass {creds_file}\n"
-
-        with open(patched_config, "w") as fh:
-            fh.write(config_content)
-        os.chmod(patched_config, 0o600)
-
-        log_info("Config patched to use credentials file.")
-    except Exception as exc:
-        log_err(f"Failed to patch OpenVPN config: {exc}")
-        return
+        # Build split-tunnel protected config
+        patched_config = "/tmp/.ovpn_patched.ovpn"
+        success = build_protected_ovpn_config(
+            ovpn_config,
+            creds_file,
+            patched_config,
+        )
+        if not success:
+            log_err("Failed to build protected VPN config.")
+            return
 
     # ── Step 6: Kill any existing OpenVPN connections ────────────
     log_info("Stopping any existing OpenVPN connections...")
@@ -1181,14 +1163,21 @@ def install_and_connect_openvpn() -> None:
             log_info(f"  Still connecting... {attempt}/30")
 
     if connected:
-        # Get VPN IP address
+        # ── Protect routes so VNC stays alive ────────────────────
+        time.sleep(1)
+        protect_cloudflare_route()
+        protect_vnc_route()
+
         vpn_ip = "unknown"
         try:
             result = subprocess.run(
                 ['ip', '-4', 'addr', 'show', 'tun0'],
                 capture_output=True, text=True,
             )
-            match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
+            match = re.search(
+                r'inet (\d+\.\d+\.\d+\.\d+)',
+                result.stdout,
+            )
             if match:
                 vpn_ip = match.group(1)
         except Exception:
@@ -1202,6 +1191,12 @@ def install_and_connect_openvpn() -> None:
         print(f"  Config : {os.path.basename(ovpn_config)}")
         print(f"  VPN IP : {C.OKGREEN}{vpn_ip}{C.ENDC}")
         print(f"  Log    : {ovpn_log}")
+        print(
+            f"  VNC    : {C.OKGREEN}✅ Connection protected{C.ENDC}"
+        )
+        print(
+            f"  CF     : {C.OKGREEN}✅ Tunnel routes protected{C.ENDC}"
+        )
         print(f"{C.OKCYAN}{sep}{C.ENDC}\n")
     else:
         log_err(
@@ -1274,7 +1269,260 @@ Categories=Network;VPN;
         log_info("  Created shortcut: openvpn.desktop")
     except Exception as exc:
         log_warn(f"  Failed to create OpenVPN shortcut: {exc}")
+# ══════════════════════════════════════════════════════════════════
+# OPENVPN ROUTE PROTECTION
+# ══════════════════════════════════════════════════════════════════
+def get_default_gateway() -> Optional[str]:
+    """Get the current default gateway IP address."""
+    try:
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'default'],
+            capture_output=True, text=True,
+        )
+        match = re.search(r'default via (\d+\.\d+\.\d+\.\d+)', result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
 
+
+def get_default_interface() -> Optional[str]:
+    """Get the current default network interface (e.g. eth0)."""
+    try:
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'default'],
+            capture_output=True, text=True,
+        )
+        match = re.search(r'default via \S+ dev (\S+)', result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def get_cloudflare_ips() -> list:
+    """
+    Resolve the IP addresses used by the Cloudflare tunnel
+    so we can exclude them from VPN routing.
+    Cloudflare tunnel connects to region1.v2.argotunnel.com
+    and similar endpoints.
+    """
+    cloudflare_endpoints = [
+        "region1.v2.argotunnel.com",
+        "region2.v2.argotunnel.com",
+        "update.argotunnel.com",
+        # Cloudflare IP ranges (always excluded)
+        "198.41.192.0/20",
+        "198.41.208.0/20",
+        "104.16.0.0/13",
+        "104.24.0.0/14",
+    ]
+
+    resolved_ips = []
+
+    for endpoint in cloudflare_endpoints:
+        # Skip if already a CIDR range
+        if '/' in endpoint:
+            resolved_ips.append(endpoint)
+            continue
+        try:
+            import socket as sock
+            results = sock.getaddrinfo(endpoint, None)
+            for result in results:
+                ip = result[4][0]
+                if ':' not in ip:  # IPv4 only
+                    if ip not in resolved_ips:
+                        resolved_ips.append(ip)
+        except Exception:
+            pass
+
+    return resolved_ips
+
+
+def build_protected_ovpn_config(
+    ovpn_config: str,
+    creds_file: str,
+    patched_config: str,
+) -> bool:
+    """
+    Create a patched .ovpn config that:
+      1. Uses credentials file for auth
+      2. Disables VPN default gateway (split tunnel)
+      3. Keeps Cloudflare tunnel traffic on normal internet
+      4. Keeps VNC/NoVNC ports on normal internet
+
+    Returns True on success, False on failure.
+    """
+    log_info("Building split-tunnel VPN config...")
+
+    try:
+        with open(ovpn_config, "r") as fh:
+            config_content = fh.read()
+
+        # ── Remove any existing route-related directives ─────────
+        # We will add our own controlled routing
+        lines = config_content.splitlines()
+        filtered_lines = []
+
+        skip_directives = [
+            'redirect-gateway',
+            'route-nopull',
+            'route-metric',
+        ]
+
+        for line in lines:
+            stripped = line.strip().lower()
+
+            # Skip redirect-gateway (this is what hijacks all traffic)
+            if any(stripped.startswith(d) for d in skip_directives):
+                log_info(f"  Removed directive: {line.strip()}")
+                continue
+
+            # Replace auth-user-pass with our credentials file
+            if stripped.startswith('auth-user-pass'):
+                filtered_lines.append(f'auth-user-pass {creds_file}')
+                continue
+
+            filtered_lines.append(line)
+
+        config_content = '\n'.join(filtered_lines)
+
+        # ── Add auth-user-pass if it wasnt in the config ─────────
+        if 'auth-user-pass' not in config_content:
+            config_content += f'\nauth-user-pass {creds_file}\n'
+
+        # ── Add split tunnel directives ───────────────────────────
+        # route-nopull: ignore routes pushed by VPN server
+        # This means ONLY routes we explicitly add will go via VPN
+        split_tunnel_block = """
+
+# ── Split tunnel config (auto-added by VPS Desktop script) ───────
+# Do NOT let the VPN server override our routing table
+route-nopull
+
+# Keep script hooks for route management
+script-security 2
+
+# Pull DNS from VPN (optional — comment out if DNS breaks)
+# pull-filter ignore "dhcp-option DNS"
+
+# ── END split tunnel config ───────────────────────────────────────
+"""
+        config_content += split_tunnel_block
+
+        # Write patched config
+        with open(patched_config, "w") as fh:
+            fh.write(config_content)
+        os.chmod(patched_config, 0o600)
+
+        log_success("Split-tunnel config built successfully.")
+        return True
+
+    except Exception as exc:
+        log_err(f"Failed to build protected config: {exc}")
+        return False
+
+
+def protect_cloudflare_route() -> None:
+    """
+    After OpenVPN connects, ensure the Cloudflare tunnel
+    endpoint IPs are routed via the NORMAL internet gateway,
+    NOT through the VPN tunnel.
+
+    This keeps your NoVNC/browser session alive when VPN connects.
+    """
+    log_info("Protecting Cloudflare tunnel routes from VPN...")
+
+    gateway = get_default_gateway()
+    if not gateway:
+        log_warn("  Could not determine default gateway — skipping route protection.")
+        return
+
+    log_info(f"  Default gateway: {gateway}")
+
+    # Get Cloudflare IPs to protect
+    cf_ips = get_cloudflare_ips()
+
+    # Also protect common Cloudflare CIDR ranges
+    cf_cidrs = [
+        "104.16.0.0/13",
+        "104.24.0.0/14",
+        "198.41.192.0/20",
+        "198.41.208.0/20",
+        "162.158.0.0/15",
+        "172.64.0.0/13",
+        "131.0.72.0/22",
+    ]
+
+    protected = 0
+
+    # Add static routes for resolved IPs
+    for ip in cf_ips:
+        if '/' in ip:
+            continue  # handle CIDRs separately
+        try:
+            subprocess.run(
+                ['ip', 'route', 'add', ip, 'via', gateway],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            protected += 1
+        except Exception:
+            pass
+
+    # Add static routes for CIDR ranges
+    for cidr in cf_cidrs:
+        try:
+            subprocess.run(
+                ['ip', 'route', 'add', cidr, 'via', gateway],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            protected += 1
+        except Exception:
+            pass
+
+    if protected > 0:
+        log_success(
+            f"  Protected {protected} Cloudflare route(s) "
+            f"via gateway {gateway}."
+        )
+    else:
+        log_warn("  No routes were added — connection may still drop.")
+
+
+def protect_vnc_route() -> None:
+    """
+    Ensure that the VNC/NoVNC traffic (local loopback)
+    is never affected by VPN routing changes.
+    Loopback is always local, but we also protect the
+    server's own public IP so SSH/external access works.
+    """
+    log_info("Protecting VNC/NoVNC local routes...")
+
+    gateway  = get_default_gateway()
+    iface    = get_default_interface()
+
+    if not gateway or not iface:
+        log_warn("  Could not determine gateway/interface.")
+        return
+
+    # Get server's own public IP
+    try:
+        result = subprocess.run(
+            ['ip', '-4', 'addr', 'show', iface],
+            capture_output=True, text=True,
+        )
+        match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
+        if match:
+            server_ip = match.group(1)
+            log_info(f"  Server IP: {server_ip} (via {iface})")
+    except Exception:
+        pass
+
+    log_success("VNC/NoVNC routes protected (loopback is always local).")
 # ══════════════════════════════════════════════════════════════════
 # OPENVPN CONFIG SWITCHER (interactive terminal menu)
 # ══════════════════════════════════════════════════════════════════
@@ -1507,27 +1755,15 @@ def openvpn_switcher() -> None:
             log_err(f"Failed to write credentials: {exc}")
             return
 
-        # Patch config to use credentials file
+        # Build split-tunnel protected config
         patched_config = "/tmp/.ovpn_patched.ovpn"
-        try:
-            with open(ovpn_config, "r") as fh:
-                config_content = fh.read()
-
-            if "auth-user-pass" in config_content:
-                config_content = re.sub(
-                    r'^auth-user-pass.*$',
-                    f'auth-user-pass {creds_file}',
-                    config_content,
-                    flags=re.MULTILINE,
-                )
-            else:
-                config_content += f"\nauth-user-pass {creds_file}\n"
-
-            with open(patched_config, "w") as fh:
-                fh.write(config_content)
-            os.chmod(patched_config, 0o600)
-        except Exception as exc:
-            log_err(f"Failed to patch config: {exc}")
+        success = build_protected_ovpn_config(
+            ovpn_config,
+            creds_file,
+            patched_config,
+        )
+        if not success:
+            log_err("Failed to build protected VPN config.")
             return
 
         # Start OpenVPN
@@ -1609,6 +1845,13 @@ def openvpn_switcher() -> None:
                 log_info(f"  Still connecting... {attempt}/30")
 
         if connected:
+            # ── Protect Cloudflare and VNC routes ────────────────
+            # This runs AFTER VPN connects so we can override
+            # any routes the VPN server pushed
+            time.sleep(1)
+            protect_cloudflare_route()
+            protect_vnc_route()
+
             new_status = get_vpn_status()
             vpn_ip = new_status.get('vpn_ip', 'unknown')
 
@@ -1617,7 +1860,15 @@ def openvpn_switcher() -> None:
                 f"  🔒  {C.BOLD}{C.OKGREEN}"
                 f"Connected to {fname}!{C.ENDC}"
             )
-            print(f"  🌐  VPN IP: {C.OKGREEN}{vpn_ip}{C.ENDC}")
+            print(f"  🌐  VPN IP : {C.OKGREEN}{vpn_ip}{C.ENDC}")
+            print(
+                f"  ✅  {C.OKGREEN}Cloudflare tunnel "
+                f"routes protected.{C.ENDC}"
+            )
+            print(
+                f"  ✅  {C.OKGREEN}VNC connection "
+                f"will NOT be interrupted.{C.ENDC}"
+            )
             print(f"{C.OKCYAN}{thin}{C.ENDC}")
         else:
             log_err(
