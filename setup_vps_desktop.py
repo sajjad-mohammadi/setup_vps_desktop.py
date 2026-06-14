@@ -1515,6 +1515,16 @@ def main():
     log_info("Step 7/7: Starting desktop services...")
     print()
 
+    # THESE ARE THE MISSING LINES:
+    supervisor = ServiceSupervisor(vnc_password, novnc_dir)
+    supervisor.run()
+
+# ══════════════════════════════════════════════════════════════════
+# SCRIPT ENTRY
+# ══════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    main()
+
 
 # ══════════════════════════════════════════════════════════════════
 # SCRIPT ENTRY
