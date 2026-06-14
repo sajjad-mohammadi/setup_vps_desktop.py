@@ -1649,7 +1649,7 @@ def main():
 
     # ── Step 4: Install VPN clients ──────────────────────────────
     log_info("Step 4/6: Installing VPN clients...")
-    #install_proton_vpn()
+    install_proton_vpn()
     #install_windscribe()
 
     # ── Step 5: Install Cloudflare tunnel ────────────────────────
