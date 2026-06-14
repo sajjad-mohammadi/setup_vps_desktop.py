@@ -541,7 +541,7 @@ def create_desktop_shortcuts() -> None:
     else:
         log_warn("No application .desktop files found to copy.")
 
-  def optimize_xfce_performance() -> None:
+def optimize_xfce_performance() -> None:
     """
     Disable XFCE compositor, animations, and visual effects
     that cause massive lag over VNC connections.
