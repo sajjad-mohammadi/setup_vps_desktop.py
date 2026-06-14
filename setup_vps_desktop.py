@@ -2493,8 +2493,7 @@ class ServiceSupervisor:
             return
 
         # Protect tunnel domain BEFORE connecting VPN
-        if self.tunnel_url:
-            protect_cloudflare_tunnel_domain(self.tunnel_url)
+        _protect_cloudflare_before_vpn(supervisor_ref=self)
 
         # Connect with full protection
         vpn_connect_with_protection(
