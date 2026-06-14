@@ -952,38 +952,43 @@ def install_windscribe() -> None:
 # ══════════════════════════════════════════════════════════════════
 def install_and_connect_openvpn() -> None:
     """
-    Install OpenVPN, find .ovpn config file in the same directory
-    as this script, ask for username/password, then connect.
-    Runs OpenVPN in background so the rest of the script continues.
+    Install OpenVPN, find .ovpn config, ask credentials, connect.
+    Uses vpn_connect_with_protection() for safe VPN switching.
     """
+    import getpass
+
     log_info("Setting up OpenVPN client...")
 
-    # ── Step 1: Install OpenVPN ──────────────────────────────────
+    # Install OpenVPN + dig for DNS resolution
     try:
-        log_info("Installing OpenVPN...")
+        log_info("Installing OpenVPN and DNS tools...")
         run_cmd_live(
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y openvpn"
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            "openvpn dnsutils"
         )
         log_success("OpenVPN installed.")
     except Exception as exc:
         log_err(f"OpenVPN installation failed: {exc}")
         return
 
-    # ── Step 2: Find .ovpn config file ───────────────────────────
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_info(f"Looking for .ovpn config files in: {script_dir}")
+    # Save network info BEFORE connecting
+    save_original_network()
 
-    ovpn_files = glob.glob(os.path.join(script_dir, "*.ovpn"))
+    # Find .ovpn files
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_info(f"Looking for .ovpn files in: {script_dir}")
+    ovpn_files = sorted(glob.glob(os.path.join(script_dir, "*.ovpn")))
 
     if not ovpn_files:
-        log_err(
-            "No .ovpn config file found!\n"
-            f"  Please place your .ovpn file in: {script_dir}\n"
-            "  Then run the script again."
+        log_warn(
+            "No .ovpn config file found.\n"
+            f"  Place your .ovpn file in: {script_dir}\n"
+            "  You can connect later using the OpenVPN Switcher "
+            "(Ctrl+C in supervisor)."
         )
         return
 
-    # If multiple .ovpn files found, let user choose
+    # Select config
     if len(ovpn_files) == 1:
         ovpn_config = ovpn_files[0]
         log_success(f"Found config: {os.path.basename(ovpn_config)}")
@@ -991,31 +996,35 @@ def install_and_connect_openvpn() -> None:
         print()
         log_info("Multiple .ovpn files found:")
         for i, f in enumerate(ovpn_files, 1):
-            print(f"  {Colors.OKCYAN}[{i}]{Colors.ENDC} {os.path.basename(f)}")
+            print(
+                f"  {Colors.OKCYAN}[{i}]{Colors.ENDC} "
+                f"{os.path.basename(f)}"
+            )
         print()
 
         while True:
             try:
                 choice = input(
-                    f"{Colors.OKBLUE}[?] Select config file "
+                    f"{Colors.OKBLUE}[?] Select config "
                     f"[1-{len(ovpn_files)}]: {Colors.ENDC}"
                 ).strip()
                 idx = int(choice) - 1
                 if 0 <= idx < len(ovpn_files):
                     ovpn_config = ovpn_files[idx]
                     break
-                else:
-                    log_warn(f"Please enter a number between 1 and {len(ovpn_files)}")
+                log_warn(
+                    f"Enter a number between 1 and {len(ovpn_files)}"
+                )
             except ValueError:
-                log_warn("Please enter a valid number.")
+                log_warn("Enter a valid number.")
             except (KeyboardInterrupt, EOFError):
                 print()
-                log_warn("OpenVPN setup cancelled.")
+                log_warn("OpenVPN setup skipped.")
                 return
 
-    log_success(f"Using config: {os.path.basename(ovpn_config)}")
+    log_success(f"Using: {os.path.basename(ovpn_config)}")
 
-    # ── Step 3: Ask for username and password ────────────────────
+    # Ask credentials
     print()
     log_info("OpenVPN credentials required:")
     print()
@@ -1024,195 +1033,23 @@ def install_and_connect_openvpn() -> None:
         username = input(
             f"  {Colors.OKCYAN}Username:{Colors.ENDC} "
         ).strip()
-
         if not username:
-            log_warn("Empty username — skipping OpenVPN connection.")
+            log_warn("Empty username — skipped.")
             return
 
-        # Use getpass for hidden password input
-        import getpass
         password = getpass.getpass(
             f"  {Colors.OKCYAN}Password:{Colors.ENDC} "
         ).strip()
-
         if not password:
-            log_warn("Empty password — skipping OpenVPN connection.")
+            log_warn("Empty password — skipped.")
             return
-
     except (KeyboardInterrupt, EOFError):
         print()
-        log_warn("OpenVPN setup cancelled.")
+        log_warn("OpenVPN setup skipped.")
         return
 
-    # ── Step 4: Write credentials to a temp file ─────────────────
-    # OpenVPN can read username/password from a file using
-    # --auth-user-pass <file> where file has two lines:
-    # line 1 = username
-    # line 2 = password
-    creds_file = "/tmp/.ovpn_credentials"
-    try:
-        with open(creds_file, "w") as fh:
-            fh.write(f"{username}\n{password}\n")
-        os.chmod(creds_file, 0o600)
-        log_info("Credentials saved to temporary file.")
-    except Exception as exc:
-        log_err(f"Failed to write credentials file: {exc}")
-        return
-
-    # ── Step 5: Patch config to use credentials file ─────────────
-    # We create a modified copy so the original .ovpn stays intact.
-        # Build split-tunnel protected config
-        patched_config = "/tmp/.ovpn_patched.ovpn"
-        success = build_protected_ovpn_config(
-            ovpn_config,
-            creds_file,
-            patched_config,
-        )
-        if not success:
-            log_err("Failed to build protected VPN config.")
-            return
-
-    # ── Step 6: Kill any existing OpenVPN connections ────────────
-    log_info("Stopping any existing OpenVPN connections...")
-    subprocess.run(
-        ['killall', 'openvpn'],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(2)
-
-    # ── Step 7: Connect to OpenVPN ───────────────────────────────
-    log_info(
-        f"Connecting to OpenVPN using: "
-        f"{os.path.basename(ovpn_config)}..."
-    )
-
-    # OpenVPN log file
-    ovpn_log = "/tmp/openvpn.log"
-
-    try:
-        openvpn_proc = subprocess.Popen(
-            [
-                'openvpn',
-                '--config', patched_config,
-                '--daemon',
-                '--log', ovpn_log,
-                '--writepid', '/tmp/openvpn.pid',
-                '--connect-retry', '3',
-                '--connect-retry-max', '5',
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        log_err(f"Failed to launch OpenVPN: {exc}")
-        return
-
-    # ── Step 8: Wait for connection and verify ───────────────────
-    log_info("Waiting for OpenVPN to connect (up to 30 seconds)...")
-
-    connected = False
-    for attempt in range(1, 31):
-        time.sleep(1)
-
-        # Check if OpenVPN is still running
-        openvpn_running = subprocess.run(
-            ['pgrep', '-x', 'openvpn'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0
-
-        if not openvpn_running:
-            log_err("OpenVPN process died!")
-            # Show last few lines of log for debugging
-            if os.path.exists(ovpn_log):
-                try:
-                    with open(ovpn_log) as fh:
-                        lines = fh.readlines()
-                    log_err("Last 10 lines of OpenVPN log:")
-                    for line in lines[-10:]:
-                        print(f"  {Colors.FAIL}{line.rstrip()}{Colors.ENDC}")
-                except Exception:
-                    pass
-            break
-
-        # Check if tun interface is up (means VPN connected)
-        try:
-            result = subprocess.run(
-                ['ip', 'addr', 'show', 'tun0'],
-                capture_output=True, text=True,
-            )
-            if result.returncode == 0 and 'inet ' in result.stdout:
-                connected = True
-                break
-        except Exception:
-            pass
-
-        # Also check log for success message
-        if os.path.exists(ovpn_log):
-            try:
-                with open(ovpn_log) as fh:
-                    log_content = fh.read()
-                if "Initialization Sequence Completed" in log_content:
-                    connected = True
-                    break
-            except Exception:
-                pass
-
-        if attempt % 5 == 0:
-            log_info(f"  Still connecting... {attempt}/30")
-
-    if connected:
-        # ── Protect routes so VNC stays alive ────────────────────
-        time.sleep(1)
-        protect_cloudflare_route()
-        protect_vnc_route()
-
-        vpn_ip = "unknown"
-        try:
-            result = subprocess.run(
-                ['ip', '-4', 'addr', 'show', 'tun0'],
-                capture_output=True, text=True,
-            )
-            match = re.search(
-                r'inet (\d+\.\d+\.\d+\.\d+)',
-                result.stdout,
-            )
-            if match:
-                vpn_ip = match.group(1)
-        except Exception:
-            pass
-
-        C = Colors
-        sep = '─' * 50
-        print(f"\n{C.OKCYAN}{sep}{C.ENDC}")
-        print(f"  🔒  {C.BOLD}{C.OKGREEN}OpenVPN Connected!{C.ENDC}")
-        print(f"{C.OKCYAN}{sep}{C.ENDC}")
-        print(f"  Config : {os.path.basename(ovpn_config)}")
-        print(f"  VPN IP : {C.OKGREEN}{vpn_ip}{C.ENDC}")
-        print(f"  Log    : {ovpn_log}")
-        print(
-            f"  VNC    : {C.OKGREEN}✅ Connection protected{C.ENDC}"
-        )
-        print(
-            f"  CF     : {C.OKGREEN}✅ Tunnel routes protected{C.ENDC}"
-        )
-        print(f"{C.OKCYAN}{sep}{C.ENDC}\n")
-    else:
-        log_err(
-            "OpenVPN connection timed out or failed.\n"
-            f"  Check log: cat {ovpn_log}"
-        )
-
-    # ── Cleanup: remove credentials file after connection ────────
-    # (OpenVPN has already read it, no longer needed on disk)
-    try:
-        if os.path.exists(creds_file):
-            os.remove(creds_file)
-            log_info("Credentials file removed from disk.")
-    except Exception:
-        pass
-
+    # Connect with full protection
+    vpn_connect_with_protection(ovpn_config, username, password)
 
 def create_openvpn_desktop_shortcut() -> None:
     """
@@ -1272,73 +1109,185 @@ Categories=Network;VPN;
 # ══════════════════════════════════════════════════════════════════
 # OPENVPN ROUTE PROTECTION
 # ══════════════════════════════════════════════════════════════════
-def get_default_gateway() -> Optional[str]:
-    """Get the current default gateway IP address."""
+# ══════════════════════════════════════════════════════════════════
+# OPENVPN CONNECTION PROTECTION
+# ══════════════════════════════════════════════════════════════════
+
+# Global: saved BEFORE any VPN connects — never changes
+_SAVED_GATEWAY   = None
+_SAVED_INTERFACE = None
+
+
+def save_original_network() -> None:
+    """
+    Save the original default gateway and interface ONCE
+    before any VPN connection ever happens.
+    Must be called early in main() before any OpenVPN work.
+    """
+    global _SAVED_GATEWAY, _SAVED_INTERFACE
+
+    if _SAVED_GATEWAY is not None:
+        return  # already saved
+
     try:
         result = subprocess.run(
             ['ip', 'route', 'show', 'default'],
             capture_output=True, text=True,
         )
-        match = re.search(r'default via (\d+\.\d+\.\d+\.\d+)', result.stdout)
-        if match:
-            return match.group(1)
-    except Exception:
-        pass
-    return None
-
-
-def get_default_interface() -> Optional[str]:
-    """Get the current default network interface (e.g. eth0)."""
-    try:
-        result = subprocess.run(
-            ['ip', 'route', 'show', 'default'],
-            capture_output=True, text=True,
+        gw_match = re.search(
+            r'default via (\d+\.\d+\.\d+\.\d+)', result.stdout
         )
-        match = re.search(r'default via \S+ dev (\S+)', result.stdout)
-        if match:
-            return match.group(1)
+        if_match = re.search(
+            r'default via \S+ dev (\S+)', result.stdout
+        )
+        if gw_match:
+            _SAVED_GATEWAY = gw_match.group(1)
+        if if_match:
+            _SAVED_INTERFACE = if_match.group(1)
     except Exception:
         pass
-    return None
+
+    if _SAVED_GATEWAY:
+        log_info(
+            f"Saved original network: gateway={_SAVED_GATEWAY} "
+            f"interface={_SAVED_INTERFACE}"
+        )
+    else:
+        log_warn("Could not determine default gateway.")
 
 
-def get_cloudflare_ips() -> list:
+def write_route_protection_script() -> str:
     """
-    Resolve the IP addresses used by the Cloudflare tunnel
-    so we can exclude them from VPN routing.
-    Cloudflare tunnel connects to region1.v2.argotunnel.com
-    and similar endpoints.
+    Write a shell script that OpenVPN calls via --route-up.
+    This script restores routes for Cloudflare after OpenVPN
+    changes the routing table.
+    Returns the path to the script.
     """
-    cloudflare_endpoints = [
-        "region1.v2.argotunnel.com",
-        "region2.v2.argotunnel.com",
-        "update.argotunnel.com",
-        # Cloudflare IP ranges (always excluded)
-        "198.41.192.0/20",
-        "198.41.208.0/20",
+    script_path = "/tmp/ovpn_protect_routes.sh"
+
+    gateway = _SAVED_GATEWAY or "NONE"
+    interface = _SAVED_INTERFACE or "eth0"
+
+    content = f"""#!/bin/bash
+# Auto-generated by VPS Desktop script
+# Protects Cloudflare tunnel routes after OpenVPN connects
+
+GATEWAY="{gateway}"
+IFACE="{interface}"
+
+if [ "$GATEWAY" = "NONE" ]; then
+    echo "No gateway saved — cannot protect routes"
+    exit 0
+fi
+
+echo "Protecting Cloudflare routes via $GATEWAY ($IFACE)..."
+
+# Cloudflare IP ranges
+CLOUDFLARE_RANGES=(
+    "104.16.0.0/13"
+    "104.24.0.0/14"
+    "198.41.192.0/20"
+    "198.41.208.0/20"
+    "162.158.0.0/15"
+    "172.64.0.0/13"
+    "131.0.72.0/22"
+    "141.101.64.0/18"
+    "190.93.240.0/20"
+    "188.114.96.0/20"
+    "197.234.240.0/22"
+    "108.162.192.0/18"
+    "173.245.48.0/20"
+)
+
+for CIDR in "${{CLOUDFLARE_RANGES[@]}}"; do
+    ip route replace "$CIDR" via "$GATEWAY" dev "$IFACE" 2>/dev/null
+done
+
+# Resolve and protect argotunnel endpoints
+for HOST in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    IPS=$(dig +short "$HOST" 2>/dev/null || getent ahosts "$HOST" 2>/dev/null | awk '{{print $1}}' | sort -u)
+    for IP in $IPS; do
+        ip route replace "$IP/32" via "$GATEWAY" dev "$IFACE" 2>/dev/null
+    done
+done
+
+echo "Routes protected."
+"""
+    with open(script_path, "w") as fh:
+        fh.write(content)
+    os.chmod(script_path, 0o755)
+    return script_path
+
+
+def protect_routes_now() -> None:
+    """
+    Manually apply route protection right now.
+    Called after OpenVPN connects.
+    """
+    if not _SAVED_GATEWAY:
+        log_warn("No saved gateway — cannot protect routes.")
+        return
+
+    log_info(f"Applying route protection via gateway {_SAVED_GATEWAY}...")
+
+    cloudflare_ranges = [
         "104.16.0.0/13",
         "104.24.0.0/14",
+        "198.41.192.0/20",
+        "198.41.208.0/20",
+        "162.158.0.0/15",
+        "172.64.0.0/13",
+        "131.0.72.0/22",
+        "141.101.64.0/18",
+        "190.93.240.0/20",
+        "188.114.96.0/20",
+        "197.234.240.0/22",
+        "108.162.192.0/18",
+        "173.245.48.0/20",
     ]
 
-    resolved_ips = []
+    protected = 0
 
-    for endpoint in cloudflare_endpoints:
-        # Skip if already a CIDR range
-        if '/' in endpoint:
-            resolved_ips.append(endpoint)
-            continue
+    for cidr in cloudflare_ranges:
+        result = subprocess.run(
+            [
+                'ip', 'route', 'replace', cidr,
+                'via', _SAVED_GATEWAY,
+                'dev', _SAVED_INTERFACE or 'eth0',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            protected += 1
+
+    # Resolve Cloudflare tunnel hostnames
+    for host in [
+        'region1.v2.argotunnel.com',
+        'region2.v2.argotunnel.com',
+    ]:
         try:
-            import socket as sock
-            results = sock.getaddrinfo(endpoint, None)
-            for result in results:
-                ip = result[4][0]
-                if ':' not in ip:  # IPv4 only
-                    if ip not in resolved_ips:
-                        resolved_ips.append(ip)
+            import socket as sock_mod
+            results = sock_mod.getaddrinfo(host, None)
+            for r in results:
+                ip = r[4][0]
+                if ':' in ip:
+                    continue
+                subprocess.run(
+                    [
+                        'ip', 'route', 'replace',
+                        f'{ip}/32',
+                        'via', _SAVED_GATEWAY,
+                        'dev', _SAVED_INTERFACE or 'eth0',
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                protected += 1
         except Exception:
             pass
 
-    return resolved_ips
+    log_success(f"Protected {protected} Cloudflare routes.")
 
 
 def build_protected_ovpn_config(
@@ -1347,196 +1296,263 @@ def build_protected_ovpn_config(
     patched_config: str,
 ) -> bool:
     """
-    Create a patched .ovpn config that:
-      1. Uses credentials file for auth
-      2. Disables VPN default gateway (split tunnel)
-      3. Keeps Cloudflare tunnel traffic on normal internet
-      4. Keeps VNC/NoVNC ports on normal internet
-
-    Returns True on success, False on failure.
+    Build a patched .ovpn config that:
+      1. Uses the credentials file
+      2. Calls route protection script after connecting
+      3. Does NOT use route-nopull (server routes still work)
     """
-    log_info("Building split-tunnel VPN config...")
+    log_info("Building VPN config with route protection...")
+
+    route_script = write_route_protection_script()
 
     try:
         with open(ovpn_config, "r") as fh:
             config_content = fh.read()
 
-        # ── Remove any existing route-related directives ─────────
-        # We will add our own controlled routing
         lines = config_content.splitlines()
         filtered_lines = []
-
-        skip_directives = [
-            'redirect-gateway',
-            'route-nopull',
-            'route-metric',
-        ]
 
         for line in lines:
             stripped = line.strip().lower()
 
-            # Skip redirect-gateway (this is what hijacks all traffic)
-            if any(stripped.startswith(d) for d in skip_directives):
-                log_info(f"  Removed directive: {line.strip()}")
-                continue
-
-            # Replace auth-user-pass with our credentials file
+            # Replace auth-user-pass
             if stripped.startswith('auth-user-pass'):
                 filtered_lines.append(f'auth-user-pass {creds_file}')
+                continue
+
+            # Remove any existing script-security / route-up
+            if stripped.startswith('script-security'):
+                continue
+            if stripped.startswith('route-up'):
+                continue
+            if stripped.startswith('up '):
                 continue
 
             filtered_lines.append(line)
 
         config_content = '\n'.join(filtered_lines)
 
-        # ── Add auth-user-pass if it wasnt in the config ─────────
+        # Add auth-user-pass if not already present
         if 'auth-user-pass' not in config_content:
             config_content += f'\nauth-user-pass {creds_file}\n'
 
-        # ── Add split tunnel directives ───────────────────────────
-        # route-nopull: ignore routes pushed by VPN server
-        # This means ONLY routes we explicitly add will go via VPN
-        split_tunnel_block = """
+        # Add route protection hooks
+        config_content += f"""
 
-# ── Split tunnel config (auto-added by VPS Desktop script) ───────
-# Do NOT let the VPN server override our routing table
-route-nopull
-
-# Keep script hooks for route management
+# ── Route protection (auto-added by VPS Desktop script) ──────────
 script-security 2
-
-# Pull DNS from VPN (optional — comment out if DNS breaks)
-# pull-filter ignore "dhcp-option DNS"
-
-# ── END split tunnel config ───────────────────────────────────────
+route-up {route_script}
+# ── END route protection ─────────────────────────────────────────
 """
-        config_content += split_tunnel_block
 
-        # Write patched config
         with open(patched_config, "w") as fh:
             fh.write(config_content)
         os.chmod(patched_config, 0o600)
 
-        log_success("Split-tunnel config built successfully.")
+        log_success("Protected VPN config built.")
         return True
 
     except Exception as exc:
-        log_err(f"Failed to build protected config: {exc}")
+        log_err(f"Failed to build config: {exc}")
         return False
 
 
-def protect_cloudflare_route() -> None:
+def vpn_connect_with_protection(
+    ovpn_config: str,
+    username: str,
+    password: str,
+    supervisor_ref=None,
+) -> bool:
     """
-    After OpenVPN connects, ensure the Cloudflare tunnel
-    endpoint IPs are routed via the NORMAL internet gateway,
-    NOT through the VPN tunnel.
+    Full VPN connection flow with route and tunnel protection:
+      1. Protect routes BEFORE connecting
+      2. Connect OpenVPN
+      3. Re-protect routes AFTER connecting
+      4. Restart Cloudflare tunnel if it died
 
-    This keeps your NoVNC/browser session alive when VPN connects.
+    Returns True if connected, False otherwise.
     """
-    log_info("Protecting Cloudflare tunnel routes from VPN...")
+    C = Colors
+    fname = os.path.basename(ovpn_config)
+    ovpn_log = "/tmp/openvpn.log"
 
-    gateway = get_default_gateway()
-    if not gateway:
-        log_warn("  Could not determine default gateway — skipping route protection.")
-        return
+    # ── 1. Save and protect routes BEFORE connecting ─────────────
+    save_original_network()
+    protect_routes_now()
 
-    log_info(f"  Default gateway: {gateway}")
+    # ── 2. Write credentials ─────────────────────────────────────
+    creds_file = "/tmp/.ovpn_credentials"
+    try:
+        with open(creds_file, "w") as fh:
+            fh.write(f"{username}\n{password}\n")
+        os.chmod(creds_file, 0o600)
+    except Exception as exc:
+        log_err(f"Failed to write credentials: {exc}")
+        return False
 
-    # Get Cloudflare IPs to protect
-    cf_ips = get_cloudflare_ips()
+    # ── 3. Build protected config ────────────────────────────────
+    patched_config = "/tmp/.ovpn_patched.ovpn"
+    if not build_protected_ovpn_config(
+        ovpn_config, creds_file, patched_config
+    ):
+        return False
 
-    # Also protect common Cloudflare CIDR ranges
-    cf_cidrs = [
-        "104.16.0.0/13",
-        "104.24.0.0/14",
-        "198.41.192.0/20",
-        "198.41.208.0/20",
-        "162.158.0.0/15",
-        "172.64.0.0/13",
-        "131.0.72.0/22",
-    ]
+    # ── 4. Kill existing OpenVPN ─────────────────────────────────
+    log_info("Stopping any existing OpenVPN...")
+    subprocess.run(
+        ['killall', 'openvpn'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)
 
-    protected = 0
-
-    # Add static routes for resolved IPs
-    for ip in cf_ips:
-        if '/' in ip:
-            continue  # handle CIDRs separately
-        try:
-            subprocess.run(
-                ['ip', 'route', 'add', ip, 'via', gateway],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            protected += 1
-        except Exception:
-            pass
-
-    # Add static routes for CIDR ranges
-    for cidr in cf_cidrs:
-        try:
-            subprocess.run(
-                ['ip', 'route', 'add', cidr, 'via', gateway],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            protected += 1
-        except Exception:
-            pass
-
-    if protected > 0:
-        log_success(
-            f"  Protected {protected} Cloudflare route(s) "
-            f"via gateway {gateway}."
+    # ── 5. Start OpenVPN ─────────────────────────────────────────
+    log_info(f"Connecting to: {fname}...")
+    try:
+        subprocess.Popen(
+            [
+                'openvpn',
+                '--config', patched_config,
+                '--daemon',
+                '--log', ovpn_log,
+                '--writepid', '/tmp/openvpn.pid',
+                '--connect-retry', '3',
+                '--connect-retry-max', '5',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+    except Exception as exc:
+        log_err(f"Failed to launch OpenVPN: {exc}")
+        return False
+
+    # ── 6. Wait for connection ───────────────────────────────────
+    log_info("Waiting for VPN connection (up to 30s)...")
+    connected = False
+
+    for attempt in range(1, 31):
+        time.sleep(1)
+
+        # Check if process is alive
+        alive = subprocess.run(
+            ['pgrep', '-x', 'openvpn'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+
+        if not alive:
+            log_err("OpenVPN process died!")
+            if os.path.exists(ovpn_log):
+                try:
+                    with open(ovpn_log) as fh:
+                        lines = fh.readlines()
+                    log_err("Last 10 lines of log:")
+                    for line in lines[-10:]:
+                        print(f"  {C.FAIL}{line.rstrip()}{C.ENDC}")
+                except Exception:
+                    pass
+            break
+
+        # Check tun interface
+        try:
+            result = subprocess.run(
+                ['ip', 'addr', 'show', 'tun0'],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0 and 'inet ' in result.stdout:
+                connected = True
+                break
+        except Exception:
+            pass
+
+        # Check log for success
+        if os.path.exists(ovpn_log):
+            try:
+                with open(ovpn_log) as fh:
+                    log_text = fh.read()
+                if "Initialization Sequence Completed" in log_text:
+                    connected = True
+                    break
+            except Exception:
+                pass
+
+        if attempt % 5 == 0:
+            log_info(f"  Still connecting... {attempt}/30")
+
+    if not connected:
+        log_err(
+            f"VPN connection failed.\n"
+            f"  Check log: cat {ovpn_log}"
+        )
+        # Clean up
+        try:
+            os.remove(creds_file)
+        except Exception:
+            pass
+        return False
+
+    # ── 7. Re-protect routes AFTER VPN is up ─────────────────────
+    log_info("Re-applying route protection after VPN connected...")
+    time.sleep(2)
+    protect_routes_now()
+
+    # ── 8. Restart Cloudflare tunnel if it died ──────────────────
+    if supervisor_ref is not None:
+        log_info("Checking Cloudflare tunnel status...")
+        time.sleep(2)
+
+        if not supervisor_ref._is_cloudflared_alive():
+            log_warn("Cloudflare tunnel died during VPN switch — restarting...")
+            supervisor_ref.ensure_cloudflared()
+        else:
+            log_success("Cloudflare tunnel is still alive.")
     else:
-        log_warn("  No routes were added — connection may still drop.")
+        log_warn(
+            "No supervisor reference — "
+            "Cloudflare tunnel may need manual restart."
+        )
 
-
-def protect_vnc_route() -> None:
-    """
-    Ensure that the VNC/NoVNC traffic (local loopback)
-    is never affected by VPN routing changes.
-    Loopback is always local, but we also protect the
-    server's own public IP so SSH/external access works.
-    """
-    log_info("Protecting VNC/NoVNC local routes...")
-
-    gateway  = get_default_gateway()
-    iface    = get_default_interface()
-
-    if not gateway or not iface:
-        log_warn("  Could not determine gateway/interface.")
-        return
-
-    # Get server's own public IP
+    # ── 9. Get VPN IP ────────────────────────────────────────────
+    vpn_ip = "unknown"
     try:
         result = subprocess.run(
-            ['ip', '-4', 'addr', 'show', iface],
+            ['ip', '-4', 'addr', 'show', 'tun0'],
             capture_output=True, text=True,
         )
         match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
         if match:
-            server_ip = match.group(1)
-            log_info(f"  Server IP: {server_ip} (via {iface})")
+            vpn_ip = match.group(1)
     except Exception:
         pass
 
-    log_success("VNC/NoVNC routes protected (loopback is always local).")
+    # ── 10. Clean up credentials ─────────────────────────────────
+    try:
+        os.remove(creds_file)
+    except Exception:
+        pass
+
+    # ── Success banner ───────────────────────────────────────────
+    thin = '─' * 50
+    print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
+    print(f"  🔒  {C.BOLD}{C.OKGREEN}OpenVPN Connected!{C.ENDC}")
+    print(f"{C.OKCYAN}{thin}{C.ENDC}")
+    print(f"  Config : {fname}")
+    print(f"  VPN IP : {C.OKGREEN}{vpn_ip}{C.ENDC}")
+    print(f"  Log    : {ovpn_log}")
+    print(f"  VNC    : {C.OKGREEN}✅ Routes protected{C.ENDC}")
+    print(f"  CF     : {C.OKGREEN}✅ Tunnel protected{C.ENDC}")
+    print(f"{C.OKCYAN}{thin}{C.ENDC}\n")
+
+    return True
+
 # ══════════════════════════════════════════════════════════════════
 # OPENVPN CONFIG SWITCHER (interactive terminal menu)
 # ══════════════════════════════════════════════════════════════════
-def openvpn_switcher() -> None:
+def openvpn_switcher(supervisor_ref=None) -> None:
     """
-    Interactive terminal menu that lets the user:
-      1. See current OpenVPN connection status
-      2. Switch between .ovpn config files
-      3. Disconnect from OpenVPN
-      4. Reconnect with new credentials
-      5. Exit the switcher
-
-    This runs in a loop until the user chooses to exit,
-    then the script continues to the next step.
+    Interactive terminal menu to switch between OpenVPN configs.
+    Receives supervisor_ref so it can restart Cloudflare tunnel
+    after VPN switch.
     """
     import getpass
 
@@ -1546,7 +1562,6 @@ def openvpn_switcher() -> None:
     thin = '─' * 58
 
     def get_vpn_status() -> dict:
-        """Check current OpenVPN connection status."""
         status = {
             'running': False,
             'connected': False,
@@ -1554,8 +1569,6 @@ def openvpn_switcher() -> None:
             'config': None,
             'pid': None,
         }
-
-        # Check if openvpn process is running
         try:
             result = subprocess.run(
                 ['pgrep', '-x', 'openvpn'],
@@ -1567,7 +1580,6 @@ def openvpn_switcher() -> None:
         except Exception:
             pass
 
-        # Check tun0 interface for VPN IP
         if status['running']:
             try:
                 result = subprocess.run(
@@ -1576,8 +1588,7 @@ def openvpn_switcher() -> None:
                 )
                 if result.returncode == 0:
                     match = re.search(
-                        r'inet (\d+\.\d+\.\d+\.\d+)',
-                        result.stdout,
+                        r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout
                     )
                     if match:
                         status['connected'] = True
@@ -1585,7 +1596,6 @@ def openvpn_switcher() -> None:
             except Exception:
                 pass
 
-        # Try to find which config is being used
         if status['running'] and status['pid']:
             try:
                 result = subprocess.run(
@@ -1593,95 +1603,73 @@ def openvpn_switcher() -> None:
                     capture_output=True, text=True,
                 )
                 if result.returncode == 0:
-                    match = re.search(
-                        r'--config\s+(\S+)',
-                        result.stdout,
-                    )
+                    match = re.search(r'--config\s+(\S+)', result.stdout)
                     if match:
-                        config_path = match.group(1)
-                        status['config'] = os.path.basename(config_path)
+                        status['config'] = os.path.basename(
+                            match.group(1)
+                        )
             except Exception:
                 pass
 
         return status
 
     def find_ovpn_files() -> list:
-        """Find all .ovpn files in the script directory."""
         return sorted(glob.glob(os.path.join(script_dir, "*.ovpn")))
 
     def print_status(status: dict) -> None:
-        """Print current VPN status block."""
         if status['connected']:
-            state_icon = "✅"
-            state_text = f"{C.OKGREEN}CONNECTED{C.ENDC}"
+            state = f"{C.OKGREEN}CONNECTED{C.ENDC}"
+            icon = "✅"
         elif status['running']:
-            state_icon = "🔄"
-            state_text = f"{C.WARNING}CONNECTING...{C.ENDC}"
+            state = f"{C.WARNING}CONNECTING...{C.ENDC}"
+            icon = "🔄"
         else:
-            state_icon = "❌"
-            state_text = f"{C.FAIL}DISCONNECTED{C.ENDC}"
+            state = f"{C.FAIL}DISCONNECTED{C.ENDC}"
+            icon = "❌"
 
-        print(f"\n  {state_icon}  Status : {state_text}")
-
+        print(f"\n  {icon}  Status : {state}")
         if status['vpn_ip']:
             print(f"  🌐  VPN IP : {C.OKGREEN}{status['vpn_ip']}{C.ENDC}")
-
         if status['config']:
             print(f"  📄  Config : {C.OKCYAN}{status['config']}{C.ENDC}")
-
         if status['pid']:
             print(f"  🔧  PID    : {status['pid']}")
 
     def print_menu(ovpn_files: list, status: dict) -> None:
-        """Print the switcher menu."""
         print(f"\n{C.OKCYAN}{sep}{C.ENDC}")
         print(f"  {C.BOLD}🔄  OpenVPN Config Switcher{C.ENDC}")
         print(f"{C.OKCYAN}{sep}{C.ENDC}")
-
         print_status(status)
-
         print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
-        print(f"  {C.BOLD}Available configs:{C.ENDC}")
-        print()
+        print(f"  {C.BOLD}Available configs:{C.ENDC}\n")
 
         if not ovpn_files:
-            print(
-                f"  {C.FAIL}No .ovpn files found in:{C.ENDC}\n"
-                f"  {script_dir}"
-            )
+            print(f"  {C.FAIL}No .ovpn files found in:{C.ENDC}")
+            print(f"  {script_dir}")
         else:
             for i, f in enumerate(ovpn_files, 1):
                 fname = os.path.basename(f)
-                # Mark currently active config
                 if status['config'] and fname == status['config']:
                     marker = f" {C.OKGREEN}◄ ACTIVE{C.ENDC}"
                 else:
                     marker = ""
-                print(
-                    f"  {C.OKCYAN}[{i}]{C.ENDC} {fname}{marker}"
-                )
+                print(f"  {C.OKCYAN}[{i}]{C.ENDC} {fname}{marker}")
 
         print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
-        print(f"  {C.BOLD}Actions:{C.ENDC}")
-        print()
-
+        print(f"  {C.BOLD}Actions:{C.ENDC}\n")
         if ovpn_files:
             print(
                 f"  {C.WARNING}[1-{len(ovpn_files)}]{C.ENDC}"
                 f"  Connect to a config"
             )
-
         if status['running']:
             print(f"  {C.WARNING}[D]{C.ENDC}      Disconnect VPN")
             print(f"  {C.WARNING}[S]{C.ENDC}      Show connection log")
-
         print(f"  {C.WARNING}[R]{C.ENDC}      Refresh status")
         print(f"  {C.WARNING}[Q]{C.ENDC}      Quit switcher & continue")
-
         print(f"{C.OKCYAN}{sep}{C.ENDC}")
 
     def disconnect_vpn() -> None:
-        """Stop any running OpenVPN process."""
         log_info("Disconnecting OpenVPN...")
         subprocess.run(
             ['killall', 'openvpn'],
@@ -1689,8 +1677,6 @@ def openvpn_switcher() -> None:
             stderr=subprocess.DEVNULL,
         )
         time.sleep(2)
-
-        # Verify disconnected
         result = subprocess.run(
             ['pgrep', '-x', 'openvpn'],
             stdout=subprocess.DEVNULL,
@@ -1699,7 +1685,6 @@ def openvpn_switcher() -> None:
         if result.returncode != 0:
             log_success("OpenVPN disconnected.")
         else:
-            log_warn("OpenVPN may still be running. Trying force kill...")
             subprocess.run(
                 ['killall', '-9', 'openvpn'],
                 stdout=subprocess.DEVNULL,
@@ -1709,191 +1694,45 @@ def openvpn_switcher() -> None:
             log_success("OpenVPN force-killed.")
 
     def connect_vpn(ovpn_config: str) -> None:
-        """Connect to a specific .ovpn config with credentials."""
-        fname = os.path.basename(ovpn_config)
-
-        # Disconnect existing connection first
         status = get_vpn_status()
         if status['running']:
             log_info("Disconnecting current VPN first...")
             disconnect_vpn()
 
         print()
-        log_info(f"Connecting to: {C.BOLD}{fname}{C.ENDC}")
+        log_info(f"Connecting to: {C.BOLD}{os.path.basename(ovpn_config)}{C.ENDC}")
         print()
 
-        # Ask for credentials
         try:
             username = input(
                 f"  {C.OKCYAN}Username:{C.ENDC} "
             ).strip()
-
             if not username:
                 log_warn("Empty username — cancelled.")
                 return
-
             password = getpass.getpass(
                 f"  {C.OKCYAN}Password:{C.ENDC} "
             ).strip()
-
             if not password:
                 log_warn("Empty password — cancelled.")
                 return
-
         except (KeyboardInterrupt, EOFError):
             print()
             log_warn("Connection cancelled.")
             return
 
-        # Write credentials to temp file
-        creds_file = "/tmp/.ovpn_credentials"
-        try:
-            with open(creds_file, "w") as fh:
-                fh.write(f"{username}\n{password}\n")
-            os.chmod(creds_file, 0o600)
-        except Exception as exc:
-            log_err(f"Failed to write credentials: {exc}")
-            return
-
-        # Build split-tunnel protected config
-        patched_config = "/tmp/.ovpn_patched.ovpn"
-        success = build_protected_ovpn_config(
-            ovpn_config,
-            creds_file,
-            patched_config,
+        vpn_connect_with_protection(
+            ovpn_config, username, password, supervisor_ref
         )
-        if not success:
-            log_err("Failed to build protected VPN config.")
-            return
-
-        # Start OpenVPN
-        ovpn_log = "/tmp/openvpn.log"
-        try:
-            subprocess.Popen(
-                [
-                    'openvpn',
-                    '--config', patched_config,
-                    '--daemon',
-                    '--log', ovpn_log,
-                    '--writepid', '/tmp/openvpn.pid',
-                    '--connect-retry', '3',
-                    '--connect-retry-max', '5',
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            log_err(f"Failed to launch OpenVPN: {exc}")
-            return
-
-        # Wait for connection
-        log_info("Waiting for connection (up to 30s)...")
-        connected = False
-
-        for attempt in range(1, 31):
-            time.sleep(1)
-
-            # Check process alive
-            alive = subprocess.run(
-                ['pgrep', '-x', 'openvpn'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode == 0
-
-            if not alive:
-                log_err("OpenVPN process died!")
-                if os.path.exists(ovpn_log):
-                    try:
-                        with open(ovpn_log) as fh:
-                            lines = fh.readlines()
-                        log_err("Last 10 lines of log:")
-                        for line in lines[-10:]:
-                            print(
-                                f"  {C.FAIL}"
-                                f"{line.rstrip()}"
-                                f"{C.ENDC}"
-                            )
-                    except Exception:
-                        pass
-                break
-
-            # Check tun0
-            try:
-                result = subprocess.run(
-                    ['ip', 'addr', 'show', 'tun0'],
-                    capture_output=True, text=True,
-                )
-                if (result.returncode == 0
-                        and 'inet ' in result.stdout):
-                    connected = True
-                    break
-            except Exception:
-                pass
-
-            # Check log for success
-            if os.path.exists(ovpn_log):
-                try:
-                    with open(ovpn_log) as fh:
-                        log_text = fh.read()
-                    if "Initialization Sequence Completed" in log_text:
-                        connected = True
-                        break
-                except Exception:
-                    pass
-
-            if attempt % 5 == 0:
-                log_info(f"  Still connecting... {attempt}/30")
-
-        if connected:
-            # ── Protect Cloudflare and VNC routes ────────────────
-            # This runs AFTER VPN connects so we can override
-            # any routes the VPN server pushed
-            time.sleep(1)
-            protect_cloudflare_route()
-            protect_vnc_route()
-
-            new_status = get_vpn_status()
-            vpn_ip = new_status.get('vpn_ip', 'unknown')
-
-            print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
-            print(
-                f"  🔒  {C.BOLD}{C.OKGREEN}"
-                f"Connected to {fname}!{C.ENDC}"
-            )
-            print(f"  🌐  VPN IP : {C.OKGREEN}{vpn_ip}{C.ENDC}")
-            print(
-                f"  ✅  {C.OKGREEN}Cloudflare tunnel "
-                f"routes protected.{C.ENDC}"
-            )
-            print(
-                f"  ✅  {C.OKGREEN}VNC connection "
-                f"will NOT be interrupted.{C.ENDC}"
-            )
-            print(f"{C.OKCYAN}{thin}{C.ENDC}")
-        else:
-            log_err(
-                f"Connection failed or timed out.\n"
-                f"  Check log: cat {ovpn_log}"
-            )
-
-        # Remove credentials file
-        try:
-            if os.path.exists(creds_file):
-                os.remove(creds_file)
-        except Exception:
-            pass
 
     def show_log() -> None:
-        """Show last 20 lines of OpenVPN log."""
         ovpn_log = "/tmp/openvpn.log"
         if not os.path.exists(ovpn_log):
             log_warn("No OpenVPN log file found.")
             return
-
         print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
         print(f"  {C.BOLD}📋  OpenVPN Log (last 20 lines):{C.ENDC}")
         print(f"{C.OKCYAN}{thin}{C.ENDC}")
-
         try:
             with open(ovpn_log) as fh:
                 lines = fh.readlines()
@@ -1901,16 +1740,15 @@ def openvpn_switcher() -> None:
                 print(f"  {line.rstrip()}")
         except Exception as exc:
             log_err(f"Could not read log: {exc}")
-
         print(f"{C.OKCYAN}{thin}{C.ENDC}")
 
-    # ── Main menu loop ───────────────────────────────────────────
+    # ── Main loop ────────────────────────────────────────────────
     log_info("Starting OpenVPN Config Switcher...")
+    save_original_network()
 
     while True:
         ovpn_files = find_ovpn_files()
         status = get_vpn_status()
-
         print_menu(ovpn_files, status)
 
         try:
@@ -1924,50 +1762,29 @@ def openvpn_switcher() -> None:
 
         if not choice:
             continue
-
-        # Quit
-        if choice == 'Q':
+        elif choice == 'Q':
             log_info("Exiting OpenVPN switcher...")
             break
-
-        # Disconnect
         elif choice == 'D':
             if status['running']:
                 disconnect_vpn()
             else:
                 log_warn("OpenVPN is not running.")
-
-        # Show log
         elif choice == 'S':
             show_log()
-
-        # Refresh
         elif choice == 'R':
-            log_info("Refreshing status...")
+            log_info("Refreshing...")
             continue
-
-        # Connect to a config by number
         elif choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(ovpn_files):
                 connect_vpn(ovpn_files[idx])
             else:
-                log_warn(
-                    f"Invalid choice. "
-                    f"Enter 1-{len(ovpn_files)}."
-                )
-
+                log_warn(f"Enter 1-{len(ovpn_files)}.")
         else:
-            log_warn(
-                "Invalid input. Use a number, "
-                "D, S, R, or Q."
-            )
+            log_warn("Invalid input.")
 
-        # Pause before refreshing menu
-        input(
-            f"\n  {C.WARNING}"
-            f"Press Enter to continue...{C.ENDC}"
-        )
+        input(f"\n  {C.WARNING}Press Enter to continue...{C.ENDC}")
 
     print()
 # ══════════════════════════════════════════════════════════════════
@@ -2577,7 +2394,7 @@ class ServiceSupervisor:
             print()
 
             try:
-                openvpn_switcher()
+                openvpn_switcher(supervisor_ref=self)
             except (KeyboardInterrupt, EOFError):
                 print()
                 log_info("Ctrl+C — shutting down all services...")
@@ -2706,7 +2523,10 @@ def main():
     # and every subsequent install step will abort.
     log_info("Step 0/6: Cleaning up stale repositories...")
     cleanup_stale_repos()
-
+    
+    # ── Save original network before any VPN work ────────────────
+    save_original_network()
+    
     # ── Step 1: Install system dependencies ──────────────────────
     log_info("Step 1/6: Installing system dependencies...")
     install_system_dependencies()
