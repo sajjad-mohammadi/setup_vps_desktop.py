@@ -541,6 +541,150 @@ def create_desktop_shortcuts() -> None:
     else:
         log_warn("No application .desktop files found to copy.")
 
+  def optimize_xfce_performance() -> None:
+    """
+    Disable XFCE compositor, animations, and visual effects
+    that cause massive lag over VNC connections.
+    """
+    log_info("Optimizing XFCE desktop for low-latency VNC...")
+
+    xfce_config_dir = os.path.expanduser("~/.config/xfce4/xfconf/xfce-perchannel-xml")
+    os.makedirs(xfce_config_dir, exist_ok=True)
+
+    # ── Disable compositor (window shadows, transparency, fade) ──
+    xfwm4_config = os.path.join(xfce_config_dir, "xfwm4.xml")
+    xfwm4_content = """<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="use_compositing" type="bool" value="false"/>
+    <property name="box_move" type="bool" value="true"/>
+    <property name="box_resize" type="bool" value="true"/>
+    <property name="cycle_draw_frame" type="bool" value="false"/>
+    <property name="cycle_raise" type="bool" value="false"/>
+    <property name="cycle_tabwin_mode" type="int" value="0"/>
+    <property name="frame_opacity" type="int" value="100"/>
+    <property name="inactive_opacity" type="int" value="100"/>
+    <property name="move_opacity" type="int" value="100"/>
+    <property name="popup_opacity" type="int" value="100"/>
+    <property name="resize_opacity" type="int" value="100"/>
+    <property name="show_frame_shadow" type="bool" value="false"/>
+    <property name="show_popup_shadow" type="bool" value="false"/>
+    <property name="zoom_desktop" type="bool" value="false"/>
+    <property name="snap_to_border" type="bool" value="true"/>
+    <property name="snap_to_windows" type="bool" value="true"/>
+    <property name="theme" type="string" value="Default"/>
+    <property name="title_font" type="string" value="Sans Bold 9"/>
+  </property>
+</channel>
+"""
+    try:
+        with open(xfwm4_config, "w") as fh:
+            fh.write(xfwm4_content)
+        log_info("  Compositor disabled (no shadows/transparency/fade).")
+    except Exception as exc:
+        log_warn(f"  Could not write xfwm4 config: {exc}")
+
+    # ── Disable desktop wallpaper (use solid color) ──────────────
+    xfdesktop_config = os.path.join(xfce_config_dir, "xfce4-desktop.xml")
+    xfdesktop_content = """<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-desktop" version="1.0">
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <property name="monitorVNC-0" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="color-style" type="int" value="0"/>
+          <property name="image-style" type="int" value="0"/>
+          <property name="last-image" type="string" value=""/>
+          <property name="rgba1" type="array">
+            <value type="uint" value="8738"/>
+            <value type="uint" value="8738"/>
+            <value type="uint" value="10794"/>
+            <value type="uint" value="65535"/>
+          </property>
+        </property>
+      </property>
+    </property>
+  </property>
+</channel>
+"""
+    try:
+        with open(xfdesktop_config, "w") as fh:
+            fh.write(xfdesktop_content)
+        log_info("  Desktop wallpaper disabled (solid color).")
+    except Exception as exc:
+        log_warn(f"  Could not write xfdesktop config: {exc}")
+
+    # ── Simplify panel and reduce icon sizes ─────────────────────
+    gtk_config_dir = os.path.expanduser("~/.config/gtk-3.0")
+    os.makedirs(gtk_config_dir, exist_ok=True)
+    gtk_css = os.path.join(gtk_config_dir, "gtk.css")
+    gtk_content = """/* Reduce padding and animations for VNC performance */
+* {
+    -gtk-icon-style: symbolic;
+    transition-duration: 0s;
+    transition-delay: 0s;
+    animation-duration: 0s;
+}
+"""
+    try:
+        with open(gtk_css, "w") as fh:
+            fh.write(gtk_content)
+        log_info("  GTK animations disabled.")
+    except Exception as exc:
+        log_warn(f"  Could not write gtk.css: {exc}")
+
+    # ── Disable thumbnails in file manager ───────────────────────
+    thunar_config = os.path.join(xfce_config_dir, "thunar.xml")
+    thunar_content = """<?xml version="1.0" encoding="UTF-8"?>
+<channel name="thunar" version="1.0">
+  <property name="misc-thumbnail-mode" type="string" value="THUNAR_THUMBNAIL_MODE_NEVER"/>
+  <property name="misc-show-thumbnails" type="bool" value="false"/>
+</channel>
+"""
+    try:
+        with open(thunar_config, "w") as fh:
+            fh.write(thunar_content)
+        log_info("  Thunar thumbnails disabled.")
+    except Exception as exc:
+        log_warn(f"  Could not write thunar config: {exc}")
+
+    # ── Disable screen saver and power management ────────────────
+    xfce4_power = os.path.join(xfce_config_dir, "xfce4-power-manager.xml")
+    power_content = """<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-power-manager" version="1.0">
+  <property name="xfce4-power-manager" type="empty">
+    <property name="dpms-enabled" type="bool" value="false"/>
+    <property name="blank-on-ac" type="int" value="0"/>
+    <property name="dpms-on-ac-sleep" type="uint" value="0"/>
+    <property name="dpms-on-ac-off" type="uint" value="0"/>
+  </property>
+</channel>
+"""
+    try:
+        with open(xfce4_power, "w") as fh:
+            fh.write(power_content)
+        log_info("  Screen saver and DPMS disabled.")
+    except Exception as exc:
+        log_warn(f"  Could not write power manager config: {exc}")
+
+    # ── Disable session save on logout (prevents stale sessions) ─
+    xfce4_session = os.path.join(xfce_config_dir, "xfce4-session.xml")
+    session_content = """<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-session" version="1.0">
+  <property name="general" type="empty">
+    <property name="SaveOnExit" type="bool" value="false"/>
+    <property name="AutoSave" type="bool" value="false"/>
+  </property>
+</channel>
+"""
+    try:
+        with open(xfce4_session, "w") as fh:
+            fh.write(session_content)
+        log_info("  Session auto-save disabled.")
+    except Exception as exc:
+        log_warn(f"  Could not write session config: {exc}")
+
+    log_success("XFCE optimized for low-latency VNC.")
 
 def _create_windscribe_shortcut(desktop_dir: str) -> None:
     """
@@ -946,8 +1090,14 @@ unset DBUS_SESSION_BUS_ADDRESS
 [ -r "$HOME/.Xresources" ] && xrdb "$HOME/.Xresources"
 
 # Background helpers — these are fine running in the background
-xsetroot -solid grey &
+xsetroot -solid "#222233" &
 vncconfig -iconic &
+xset s off &
+xset s noblank &
+xset -dpms &
+
+export GDK_RENDERING=image
+export LIBGL_ALWAYS_SOFTWARE=1
 
 # ── CRITICAL: startxfce4 runs in the FOREGROUND via exec ─────────
 # No trailing '&' here. VNC keeps the session alive as long as
@@ -966,8 +1116,8 @@ exec dbus-launch --exit-with-session startxfce4
     log_info("Starting VNC server on display :1 (1920x1080)...")
     cmd = [
         'vncserver', ':1',
-        '-geometry', '1280x720',
-        '-depth', '24',
+        '-geometry', '1024x768',
+        '-depth', '16',
         '-localhost', 'no',
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1096,8 +1246,8 @@ def _patch_novnc_autoscale(novnc_dir: str) -> None:
             var params = [
                 "autoconnect=true",
                 "resize=scale",
-                "quality=6",
-                "compression=2",
+                "quality=3",
+                "compression=9",
                 "show_dot=true",
                 "reconnect=true",
                 "reconnect_delay=2000"
@@ -1510,12 +1660,15 @@ def main():
     log_info("Step 6/7: Creating desktop shortcuts...")
     create_desktop_shortcuts()
 
-    # ── Step 7: Launch and supervise all services ────────────────
+    # ── Step 7: Optimize XFCE for VNC performance ────────────────
+    log_info("Step 7/8: Optimizing desktop for low-latency VNC...")
+    optimize_xfce_performance()
+
+    # ── Step 8: Launch and supervise all services ────────────────
     print()
-    log_info("Step 7/7: Starting desktop services...")
+    log_info("Step 8/8: Starting desktop services...")
     print()
 
-    # THESE ARE THE MISSING LINES:
     supervisor = ServiceSupervisor(vnc_password, novnc_dir)
     supervisor.run()
 
