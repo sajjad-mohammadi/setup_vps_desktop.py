@@ -1303,12 +1303,18 @@ def build_protected_ovpn_config(
                 filtered_lines.append(f'auth-user-pass {creds_file}')
                 continue
 
-            # Remove any existing script-security / route-up
+            # Remove directives we will add ourselves
             if stripped.startswith('script-security'):
                 continue
             if stripped.startswith('route-up'):
                 continue
             if stripped.startswith('up '):
+                continue
+            if stripped.startswith('redirect-gateway'):
+                continue
+            if stripped.startswith('route-nopull'):
+                continue
+            if stripped.startswith('pull-filter'):
                 continue
 
             filtered_lines.append(line)
@@ -1320,11 +1326,21 @@ def build_protected_ovpn_config(
             config_content += f'\nauth-user-pass {creds_file}\n'
 
         # Add route protection hooks
+        # Add route protection hooks
+        # NOTE: We do NOT use route-nopull anymore.
+        # Instead we let the server push routes normally,
+        # but we use pull-filter to ignore redirect-gateway.
+        # Then we manually add our own default route + DNS.
         config_content += f"""
 
 # ── Route protection (auto-added by VPS Desktop script) ──────────
 script-security 2
 route-up {route_script}
+
+# Ignore server's redirect-gateway (we add our own default route)
+pull-filter ignore "redirect-gateway"
+
+# Accept everything else the server pushes (DNS, routes, etc.)
 # ── END route protection ─────────────────────────────────────────
 """
 
@@ -1338,7 +1354,318 @@ route-up {route_script}
     except Exception as exc:
         log_err(f"Failed to build config: {exc}")
         return False
+def _get_vpn_gateway() -> Optional[str]:
+    """Get the VPN tunnel's gateway IP from tun0 route."""
+    try:
+        # Method 1: check routes for tun0
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'dev', 'tun0'],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            # Look for "via X.X.X.X" or gateway in tun0 routes
+            match = re.search(
+                r'via (\d+\.\d+\.\d+\.\d+)',
+                result.stdout,
+            )
+            if match:
+                return match.group(1)
 
+            # Some configs use point-to-point: look for remote endpoint
+            match = re.search(
+                r'(\d+\.\d+\.\d+\.\d+)\s+dev\s+tun0',
+                result.stdout,
+            )
+            if match:
+                return match.group(1)
+
+        # Method 2: peer address from ifconfig
+        result = subprocess.run(
+            ['ip', 'addr', 'show', 'tun0'],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            match = re.search(
+                r'peer (\d+\.\d+\.\d+\.\d+)',
+                result.stdout,
+            )
+            if match:
+                return match.group(1)
+
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_vpn_ip() -> Optional[str]:
+    """Get the VPN-assigned IP from tun0."""
+    try:
+        result = subprocess.run(
+            ['ip', '-4', 'addr', 'show', 'tun0'],
+            capture_output=True, text=True,
+        )
+        match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _add_vpn_default_route(vpn_gateway: str) -> None:
+    """
+    Add a default route through the VPN tunnel with a LOWER
+    metric than the original default route. This sends general
+    internet traffic through VPN while Cloudflare-protected
+    routes still use the original gateway.
+    """
+    log_info(f"Adding VPN default route via {vpn_gateway}...")
+
+    # Add VPN default route with lower metric (higher priority)
+    result = subprocess.run(
+        [
+            'ip', 'route', 'replace', 'default',
+            'via', vpn_gateway,
+            'dev', 'tun0',
+            'metric', '50',
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if result.returncode == 0:
+        log_success(f"  VPN default route added (metric 50).")
+    else:
+        # Try alternative: add 0.0.0.0/1 and 128.0.0.0/1
+        # This overrides default without removing it
+        log_info("  Trying split-default method...")
+        for net in ['0.0.0.0/1', '128.0.0.0/1']:
+            subprocess.run(
+                [
+                    'ip', 'route', 'replace', net,
+                    'via', vpn_gateway,
+                    'dev', 'tun0',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        log_success("  Split-default routes added via VPN.")
+
+    # Keep original gateway with higher metric (backup)
+    if _SAVED_GATEWAY and _SAVED_INTERFACE:
+        subprocess.run(
+            [
+                'ip', 'route', 'replace', 'default',
+                'via', _SAVED_GATEWAY,
+                'dev', _SAVED_INTERFACE,
+                'metric', '200',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log_info(
+            f"  Original gateway {_SAVED_GATEWAY} kept "
+            f"as backup (metric 200)."
+        )
+
+
+def _setup_vpn_dns(ovpn_log: str) -> None:
+    """
+    Extract DNS servers from the OpenVPN log and update
+    /etc/resolv.conf so the system uses VPN DNS.
+    Falls back to well-known public DNS if extraction fails.
+    """
+    log_info("Setting up DNS for VPN...")
+
+    dns_servers = []
+
+    # ── Try to extract DNS from OpenVPN log ──────────────────────
+    if os.path.exists(ovpn_log):
+        try:
+            with open(ovpn_log) as fh:
+                log_content = fh.read()
+
+            # Pattern: PUSH: ... dhcp-option DNS x.x.x.x ...
+            matches = re.findall(
+                r'dhcp-option DNS (\d+\.\d+\.\d+\.\d+)',
+                log_content,
+            )
+            if matches:
+                dns_servers = list(dict.fromkeys(matches))  # unique
+                log_info(f"  Found VPN DNS servers: {dns_servers}")
+        except Exception:
+            pass
+
+    # ── Fallback: use public DNS that work through VPN ───────────
+    if not dns_servers:
+        dns_servers = [
+            '1.1.1.1',       # Cloudflare DNS
+            '8.8.8.8',       # Google DNS
+            '9.9.9.9',       # Quad9 DNS
+        ]
+        log_warn(
+            "  Could not extract VPN DNS — "
+            f"using public DNS: {dns_servers}"
+        )
+
+    # ── Backup original resolv.conf ──────────────────────────────
+    resolv = "/etc/resolv.conf"
+    backup = "/etc/resolv.conf.bak.vpnsetup"
+
+    if not os.path.exists(backup):
+        try:
+            shutil.copy2(resolv, backup)
+            log_info(f"  Backed up original resolv.conf → {backup}")
+        except Exception:
+            pass
+
+    # ── Write new resolv.conf ────────────────────────────────────
+    try:
+        with open(resolv, "w") as fh:
+            fh.write(
+                "# Generated by VPS Desktop VPN setup\n"
+                "# Original backed up at "
+                f"{backup}\n"
+            )
+            for dns in dns_servers:
+                fh.write(f"nameserver {dns}\n")
+            # Add original DNS as fallback
+            if _SAVED_GATEWAY:
+                fh.write(
+                    f"# Original gateway DNS (fallback)\n"
+                    f"# nameserver {_SAVED_GATEWAY}\n"
+                )
+        log_success(f"  DNS updated: {', '.join(dns_servers)}")
+    except Exception as exc:
+        log_err(f"  Failed to update resolv.conf: {exc}")
+
+
+def _protect_dns_routes() -> None:
+    """
+    Add routes so DNS server IPs go through the VPN tunnel,
+    not through the original gateway. This ensures DNS queries
+    are encrypted through the VPN.
+    """
+    log_info("Protecting DNS routes through VPN...")
+
+    # Read current DNS servers from resolv.conf
+    try:
+        with open("/etc/resolv.conf") as fh:
+            content = fh.read()
+        dns_ips = re.findall(
+            r'^nameserver (\d+\.\d+\.\d+\.\d+)',
+            content,
+            re.MULTILINE,
+        )
+    except Exception:
+        dns_ips = []
+
+    if not dns_ips:
+        return
+
+    # DNS should go through VPN (tun0), not original gateway
+    # EXCEPT for the original gateway's DNS (if it was one)
+    vpn_gateway = _get_vpn_gateway()
+    if not vpn_gateway:
+        return
+
+    for dns_ip in dns_ips:
+        # Don't route the VPS's own gateway through VPN
+        if dns_ip == _SAVED_GATEWAY:
+            continue
+
+        subprocess.run(
+            [
+                'ip', 'route', 'replace',
+                f'{dns_ip}/32',
+                'via', vpn_gateway,
+                'dev', 'tun0',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    log_success(f"  DNS routes set through VPN tunnel.")
+
+
+def _verify_internet() -> None:
+    """
+    Quick check to verify DNS and internet work after VPN connects.
+    """
+    log_info("Verifying internet connectivity through VPN...")
+
+    # Test DNS resolution
+    dns_ok = False
+    try:
+        import socket as sock_mod
+        result = sock_mod.getaddrinfo("google.com", 80)
+        if result:
+            dns_ok = True
+            log_success("  DNS resolution: ✅ working")
+    except Exception:
+        log_warn("  DNS resolution: ❌ failed")
+
+    if not dns_ok:
+        # Try fixing DNS with fallback servers
+        log_warn("  Attempting DNS fix with fallback servers...")
+        try:
+            with open("/etc/resolv.conf", "w") as fh:
+                fh.write("nameserver 1.1.1.1\n")
+                fh.write("nameserver 8.8.8.8\n")
+                fh.write("nameserver 9.9.9.9\n")
+            log_info("  Wrote fallback DNS servers to resolv.conf")
+
+            # Re-test
+            import socket as sock_mod
+            result = sock_mod.getaddrinfo("google.com", 80)
+            if result:
+                log_success("  DNS resolution after fix: ✅ working")
+            else:
+                log_err("  DNS still not working.")
+        except Exception as exc:
+            log_err(f"  DNS fix failed: {exc}")
+
+    # Test HTTP connectivity
+    try:
+        req = urllib.request.Request(
+            "http://httpbin.org/ip",
+            headers={'User-Agent': 'curl/7.0'},
+        )
+        response = urllib.request.urlopen(req, timeout=10)
+        data = response.read().decode()
+        match = re.search(r'"origin":\s*"([^"]+)"', data)
+        if match:
+            public_ip = match.group(1)
+            log_success(f"  Internet: ✅ working (public IP: {public_ip})")
+        else:
+            log_success("  Internet: ✅ working")
+    except Exception:
+        log_warn("  Internet connectivity test inconclusive.")
+
+
+def restore_original_dns() -> None:
+    """
+    Restore the original resolv.conf when VPN disconnects.
+    Called from the switcher's disconnect function.
+    """
+    backup = "/etc/resolv.conf.bak.vpnsetup"
+    resolv = "/etc/resolv.conf"
+
+    if os.path.exists(backup):
+        try:
+            shutil.copy2(backup, resolv)
+            log_success("Original DNS restored from backup.")
+        except Exception as exc:
+            log_warn(f"Could not restore DNS: {exc}")
+    else:
+        # Write sane defaults
+        try:
+            with open(resolv, "w") as fh:
+                fh.write("nameserver 1.1.1.1\n")
+                fh.write("nameserver 8.8.8.8\n")
+            log_info("Wrote default DNS servers.")
+        except Exception:
+            pass
 
 def vpn_connect_with_protection(
     ovpn_config: str,
@@ -1347,11 +1674,14 @@ def vpn_connect_with_protection(
     supervisor_ref=None,
 ) -> bool:
     """
-    Full VPN connection flow with route and tunnel protection:
-      1. Protect routes BEFORE connecting
-      2. Connect OpenVPN
-      3. Re-protect routes AFTER connecting
-      4. Restart Cloudflare tunnel if it died
+    Full VPN connection flow:
+      1. Protect Cloudflare routes BEFORE connecting
+      2. Connect OpenVPN (with route-nopull)
+      3. Extract DNS servers from VPN
+      4. Add default route through VPN for internet
+      5. Re-protect Cloudflare routes (so tunnel stays alive)
+      6. Update DNS to use VPN's DNS servers
+      7. Restart Cloudflare tunnel if it died
 
     Returns True if connected, False otherwise.
     """
@@ -1362,6 +1692,9 @@ def vpn_connect_with_protection(
     # ── 1. Save and protect routes BEFORE connecting ─────────────
     save_original_network()
     protect_routes_now()
+
+    if supervisor_ref and supervisor_ref.tunnel_url:
+        protect_cloudflare_tunnel_domain(supervisor_ref.tunnel_url)
 
     # ── 2. Write credentials ─────────────────────────────────────
     creds_file = "/tmp/.ovpn_credentials"
@@ -1401,6 +1734,7 @@ def vpn_connect_with_protection(
                 '--writepid', '/tmp/openvpn.pid',
                 '--connect-retry', '3',
                 '--connect-retry-max', '5',
+                '--pull-filter', 'ignore', 'redirect-gateway',
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1416,7 +1750,6 @@ def vpn_connect_with_protection(
     for attempt in range(1, 31):
         time.sleep(1)
 
-        # Check if process is alive
         alive = subprocess.run(
             ['pgrep', '-x', 'openvpn'],
             stdout=subprocess.DEVNULL,
@@ -1429,14 +1762,14 @@ def vpn_connect_with_protection(
                 try:
                     with open(ovpn_log) as fh:
                         lines = fh.readlines()
-                    log_err("Last 10 lines of log:")
+                    log_err("Last 10 lines:")
                     for line in lines[-10:]:
                         print(f"  {C.FAIL}{line.rstrip()}{C.ENDC}")
                 except Exception:
                     pass
             break
 
-        # Check tun interface
+        # Check tun0
         try:
             result = subprocess.run(
                 ['ip', 'addr', 'show', 'tun0'],
@@ -1448,7 +1781,7 @@ def vpn_connect_with_protection(
         except Exception:
             pass
 
-        # Check log for success
+        # Check log
         if os.path.exists(ovpn_log):
             try:
                 with open(ovpn_log) as fh:
@@ -1463,78 +1796,79 @@ def vpn_connect_with_protection(
             log_info(f"  Still connecting... {attempt}/30")
 
     if not connected:
-        log_err(
-            f"VPN connection failed.\n"
-            f"  Check log: cat {ovpn_log}"
-        )
-        # Clean up
+        log_err(f"VPN connection failed. Check: cat {ovpn_log}")
         try:
             os.remove(creds_file)
         except Exception:
             pass
         return False
 
-    # ── 7. Re-protect routes AFTER VPN is up ─────────────────────
-    log_info("Re-applying route protection after VPN connected...")
+    # ── 7. Setup VPN routing and DNS ─────────────────────────────
+    log_info("Setting up VPN routing and DNS...")
     time.sleep(2)
+
+    # Get the VPN tunnel gateway
+    vpn_gateway = _get_vpn_gateway()
+    vpn_ip = _get_vpn_ip()
+
+    # Add default route through VPN for internet traffic
+    if vpn_gateway:
+        _add_vpn_default_route(vpn_gateway)
+
+    # Extract and apply VPN DNS servers
+    _setup_vpn_dns(ovpn_log)
+
+    # ── 8. Re-protect Cloudflare routes ──────────────────────────
+    log_info("Re-protecting Cloudflare routes after VPN connected...")
     protect_routes_now()
 
-    # Protect the specific Cloudflare tunnel domain
     if supervisor_ref and supervisor_ref.tunnel_url:
         protect_cloudflare_tunnel_domain(supervisor_ref.tunnel_url)
 
-    # ── 8. Restart Cloudflare tunnel if it died ──────────────────
+    # ── 9. Protect DNS resolver IPs ──────────────────────────────
+    _protect_dns_routes()
+
+    # ── 10. Restart Cloudflare tunnel if needed ──────────────────
     if supervisor_ref is not None:
-        log_info("Checking Cloudflare tunnel status...")
+        log_info("Checking Cloudflare tunnel...")
         time.sleep(2)
 
         if not supervisor_ref._is_cloudflared_alive():
-            log_warn("Cloudflare tunnel died during VPN switch — restarting...")
+            log_warn("Cloudflare tunnel died — restarting...")
             supervisor_ref.ensure_cloudflared()
+
+            # Re-protect the new tunnel URL
+            time.sleep(5)
+            if supervisor_ref.tunnel_url:
+                protect_cloudflare_tunnel_domain(supervisor_ref.tunnel_url)
         else:
             log_success("Cloudflare tunnel is still alive.")
-    else:
-        log_warn(
-            "No supervisor reference — "
-            "Cloudflare tunnel may need manual restart."
-        )
 
-    # ── 9. Get VPN IP ────────────────────────────────────────────
-    vpn_ip = "unknown"
-    try:
-        result = subprocess.run(
-            ['ip', '-4', 'addr', 'show', 'tun0'],
-            capture_output=True, text=True,
-        )
-        match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
-        if match:
-            vpn_ip = match.group(1)
-    except Exception:
-        pass
-
-    # ── 10. Clean up credentials ─────────────────────────────────
+    # ── 11. Clean up credentials ─────────────────────────────────
     try:
         os.remove(creds_file)
     except Exception:
         pass
 
+    # ── 12. Verify internet works ────────────────────────────────
+    _verify_internet()
+
     # ── Success banner ───────────────────────────────────────────
-    thin = '─' * 50
+    thin = '─' * 55
     print(f"\n{C.OKCYAN}{thin}{C.ENDC}")
     print(f"  🔒  {C.BOLD}{C.OKGREEN}OpenVPN Connected!{C.ENDC}")
     print(f"{C.OKCYAN}{thin}{C.ENDC}")
-    print(f"  Config : {fname}")
-    print(f"  VPN IP : {C.OKGREEN}{vpn_ip}{C.ENDC}")
-    print(f"  Log    : {ovpn_log}")
-    print(f"  VNC    : {C.OKGREEN}✅ Routes protected{C.ENDC}")
-    print(f"  CF     : {C.OKGREEN}✅ Tunnel protected{C.ENDC}")
+    print(f"  Config  : {fname}")
+    print(f"  VPN IP  : {C.OKGREEN}{vpn_ip or 'unknown'}{C.ENDC}")
+    print(f"  Gateway : {vpn_gateway or 'unknown'}")
+    print(f"  Log     : {ovpn_log}")
+    print(f"  DNS     : {C.OKGREEN}✅ Using VPN DNS{C.ENDC}")
+    print(f"  VNC     : {C.OKGREEN}✅ Routes protected{C.ENDC}")
+    print(f"  Tunnel  : {C.OKGREEN}✅ Cloudflare protected{C.ENDC}")
     print(f"{C.OKCYAN}{thin}{C.ENDC}\n")
 
     return True
-
-# ══════════════════════════════════════════════════════════════════
-# OPENVPN CONFIG SWITCHER (interactive terminal menu)
-# ══════════════════════════════════════════════════════════════════
+    
 def openvpn_switcher(supervisor_ref=None) -> None:
     """
     Interactive terminal menu to switch between OpenVPN configs.
@@ -1664,6 +1998,7 @@ def openvpn_switcher(supervisor_ref=None) -> None:
             stderr=subprocess.DEVNULL,
         )
         time.sleep(2)
+
         result = subprocess.run(
             ['pgrep', '-x', 'openvpn'],
             stdout=subprocess.DEVNULL,
@@ -1679,6 +2014,31 @@ def openvpn_switcher(supervisor_ref=None) -> None:
             )
             time.sleep(1)
             log_success("OpenVPN force-killed.")
+
+        # Restore original routing and DNS
+        log_info("Restoring original network routes...")
+        if _SAVED_GATEWAY and _SAVED_INTERFACE:
+            subprocess.run(
+                [
+                    'ip', 'route', 'replace', 'default',
+                    'via', _SAVED_GATEWAY,
+                    'dev', _SAVED_INTERFACE,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Remove VPN split routes
+            for net in ['0.0.0.0/1', '128.0.0.0/1']:
+                subprocess.run(
+                    ['ip', 'route', 'del', net],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            log_success(
+                f"Original route restored via {_SAVED_GATEWAY}."
+            )
+
+        restore_original_dns()
 
     def connect_vpn(ovpn_config: str) -> None:
         status = get_vpn_status()
