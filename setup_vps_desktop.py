@@ -476,6 +476,108 @@ def _patch_edge_for_root() -> None:
     except Exception as exc:
         log_warn(f"Edge patch failed (non-fatal): {exc}")
 # ══════════════════════════════════════════════════════════════════
+# DESKTOP SHORTCUTS
+# ══════════════════════════════════════════════════════════════════
+def create_desktop_shortcuts() -> None:
+    """
+    Copy .desktop files for installed applications to the
+    user's Desktop folder and make them trusted/executable
+    so XFCE shows them as clickable icons.
+    """
+    log_info("Creating desktop shortcuts...")
+
+    desktop_dir = os.path.expanduser("~/Desktop")
+    os.makedirs(desktop_dir, exist_ok=True)
+
+    # List of .desktop files to look for
+    shortcut_sources = [
+        # Browsers
+        "/usr/share/applications/firefox.desktop",
+        "/usr/share/applications/firefox-esr.desktop",
+        "/usr/share/applications/microsoft-edge.desktop",
+        # VPN clients
+        "/usr/share/applications/protonvpn-app.desktop",
+        "/usr/share/applications/protonvpn.desktop",
+        "/usr/share/applications/proton-vpn-gnome-desktop.desktop",
+        # System tools
+        "/usr/share/applications/xfce4-terminal.desktop",
+        "/usr/share/applications/thunar.desktop",
+        "/usr/share/applications/xfce4-taskmanager.desktop",
+    ]
+
+    created = 0
+    for src in shortcut_sources:
+        if not os.path.exists(src):
+            continue
+
+        filename = os.path.basename(src)
+        dest = os.path.join(desktop_dir, filename)
+
+        try:
+            shutil.copy2(src, dest)
+            os.chmod(dest, 0o755)
+
+            # Mark as trusted so XFCE doesn't show
+            # "Untrusted application launcher" warning
+            subprocess.run(
+                [
+                    'dbus-launch', 'gio', 'set', dest,
+                    'metadata::trusted', 'true',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            log_info(f"  Created shortcut: {filename}")
+            created += 1
+        except Exception as exc:
+            log_warn(f"  Failed to create shortcut {filename}: {exc}")
+
+    # Create a custom Windscribe shortcut (CLI app, no .desktop file)
+    _create_windscribe_shortcut(desktop_dir)
+
+    if created > 0:
+        log_success(f"Created {created} desktop shortcut(s).")
+    else:
+        log_warn("No application .desktop files found to copy.")
+
+
+def _create_windscribe_shortcut(desktop_dir: str) -> None:
+    """
+    Windscribe CLI has no .desktop file.
+    Create one that opens a terminal with windscribe status.
+    """
+    if not shutil.which("windscribe"):
+        return
+
+    shortcut = os.path.join(desktop_dir, "windscribe.desktop")
+    content = """[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Windscribe VPN
+Comment=Windscribe VPN CLI
+Exec=xfce4-terminal --hold -e "bash -c 'echo === Windscribe VPN ===; windscribe status; echo; echo Commands: windscribe login / windscribe connect / windscribe disconnect; exec bash'"
+Icon=network-vpn
+Terminal=false
+Categories=Network;VPN;
+"""
+    try:
+        with open(shortcut, "w") as fh:
+            fh.write(content)
+        os.chmod(shortcut, 0o755)
+
+        subprocess.run(
+            [
+                'dbus-launch', 'gio', 'set', shortcut,
+                'metadata::trusted', 'true',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log_info("  Created shortcut: windscribe.desktop")
+    except Exception as exc:
+        log_warn(f"  Failed to create Windscribe shortcut: {exc}")
+# ══════════════════════════════════════════════════════════════════
 # 10. PROTON VPN
 # ══════════════════════════════════════════════════════════════════
 def install_proton_vpn() -> None:
@@ -864,7 +966,7 @@ exec dbus-launch --exit-with-session startxfce4
     log_info("Starting VNC server on display :1 (1920x1080)...")
     cmd = [
         'vncserver', ':1',
-        '-geometry', '1920x1080',
+        '-geometry', '1280x720',
         '-depth', '24',
         '-localhost', 'no',
     ]
@@ -895,12 +997,17 @@ exec dbus-launch --exit-with-session startxfce4
 def start_novnc(novnc_dir: str):
     """
     Launch websockify to proxy HTTP port 6080 → VNC port 5901.
+    Also patches the NoVNC index.html to enable auto-scaling
+    and auto-resize so the desktop fits the browser window.
     Returns the Popen process handle.
     """
     log_info(
         f"Starting NoVNC proxy  (6080 → 5901)  "
         f"webroot: {novnc_dir}"
     )
+
+    # ── Patch NoVNC to enable auto-scaling by default ────────────
+    _patch_novnc_autoscale(novnc_dir)
 
     # Free port 6080 in case something is already there
     subprocess.run(
@@ -918,6 +1025,121 @@ def start_novnc(novnc_dir: str):
     )
     log_success("NoVNC proxy launched on port 6080.")
     return proc
+
+
+def _patch_novnc_autoscale(novnc_dir: str) -> None:
+    """
+    Modify the NoVNC launch page so that when users connect,
+    the desktop automatically scales to fit the browser window
+    instead of showing at native 1:1 resolution (which causes
+    scrollbars).
+
+    This works by adding resize=scale and autoconnect params
+    to vnc.html (or vnc_lite.html / index.html).
+    """
+    log_info("Patching NoVNC for auto-scaling...")
+
+    # Find the main HTML file NoVNC uses
+    html_candidates = [
+        os.path.join(novnc_dir, "vnc.html"),
+        os.path.join(novnc_dir, "vnc_lite.html"),
+        os.path.join(novnc_dir, "index.html"),
+    ]
+
+    target_html = None
+    for path in html_candidates:
+        if os.path.exists(path):
+            target_html = path
+            break
+
+    if target_html is None:
+        log_warn("  Could not find NoVNC HTML file to patch.")
+        return
+
+    # Create a custom index.html that redirects with scaling params
+    custom_index = os.path.join(novnc_dir, "index.html")
+
+    # Determine the target page name (e.g. vnc.html)
+    target_page = os.path.basename(target_html)
+
+    redirect_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>VPS Desktop</title>
+    <meta charset="utf-8">
+    <style>
+        body {{
+            background: #1a1a2e;
+            color: #eee;
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }}
+        .loader {{
+            text-align: center;
+        }}
+        .loader h1 {{
+            font-size: 2em;
+            margin-bottom: 10px;
+        }}
+        .loader p {{
+            font-size: 1.2em;
+            color: #aaa;
+        }}
+    </style>
+    <script>
+        // Auto-redirect with scaling parameters
+        window.onload = function() {{
+            var params = [
+                "autoconnect=true",
+                "resize=scale",
+                "quality=6",
+                "compression=2",
+                "show_dot=true",
+                "reconnect=true",
+                "reconnect_delay=2000"
+            ];
+            window.location.href = "{target_page}?" + params.join("&");
+        }};
+    </script>
+</head>
+<body>
+    <div class="loader">
+        <h1>🖥️ VPS Desktop</h1>
+        <p>Connecting to your desktop...</p>
+    </div>
+</body>
+</html>
+"""
+
+    try:
+        # Only overwrite index.html if it is not the same as target
+        if custom_index != target_html:
+            with open(custom_index, "w") as fh:
+                fh.write(redirect_html)
+            log_success(
+                f"  Created auto-scaling index.html → {target_page}"
+            )
+        else:
+            # target IS index.html — create a wrapper redirect
+            # Rename original index.html to desktop.html
+            backup = os.path.join(novnc_dir, "desktop.html")
+            if not os.path.exists(backup):
+                shutil.copy2(target_html, backup)
+
+            redirect_html_fixed = redirect_html.replace(
+                target_page, "desktop.html"
+            )
+            with open(custom_index, "w") as fh:
+                fh.write(redirect_html_fixed)
+            log_success(
+                "  Created auto-scaling index.html → desktop.html"
+            )
+    except Exception as exc:
+        log_warn(f"  NoVNC auto-scale patch failed (non-fatal): {exc}")
 # ══════════════════════════════════════════════════════════════════
 # 15. SERVICE SUPERVISOR
 # ══════════════════════════════════════════════════════════════════
@@ -1281,16 +1503,17 @@ def main():
     install_windscribe()
 
     # ── Step 5: Install Cloudflare tunnel ────────────────────────
-    log_info("Step 5/6: Installing Cloudflare tunnel client...")
+    log_info("Step 5/7: Installing Cloudflare tunnel client...")
     install_cloudflared()
 
-    # ── Step 6: Launch and supervise all services ────────────────
-    print()
-    log_info("Step 6/6: Starting desktop services...")
-    print()
+    # ── Step 6: Create desktop shortcuts ─────────────────────────
+    log_info("Step 6/7: Creating desktop shortcuts...")
+    create_desktop_shortcuts()
 
-    supervisor = ServiceSupervisor(vnc_password, novnc_dir)
-    supervisor.run()
+    # ── Step 7: Launch and supervise all services ────────────────
+    print()
+    log_info("Step 7/7: Starting desktop services...")
+    print()
 
 
 # ══════════════════════════════════════════════════════════════════
