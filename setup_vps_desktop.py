@@ -535,6 +535,7 @@ def create_desktop_shortcuts() -> None:
 
     # Create a custom Windscribe shortcut (CLI app, no .desktop file)
     _create_windscribe_shortcut(desktop_dir)
+    create_openvpn_desktop_shortcut()
 
     if created > 0:
         log_success(f"Created {created} desktop shortcut(s).")
@@ -946,7 +947,333 @@ def install_windscribe() -> None:
             "  Manual install: https://windscribe.com/guides/linux"
         )
 
+# ══════════════════════════════════════════════════════════════════
+# 12. OPENVPN CLIENT
+# ══════════════════════════════════════════════════════════════════
+def install_and_connect_openvpn() -> None:
+    """
+    Install OpenVPN, find .ovpn config file in the same directory
+    as this script, ask for username/password, then connect.
+    Runs OpenVPN in background so the rest of the script continues.
+    """
+    log_info("Setting up OpenVPN client...")
 
+    # ── Step 1: Install OpenVPN ──────────────────────────────────
+    try:
+        log_info("Installing OpenVPN...")
+        run_cmd_live(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y openvpn"
+        )
+        log_success("OpenVPN installed.")
+    except Exception as exc:
+        log_err(f"OpenVPN installation failed: {exc}")
+        return
+
+    # ── Step 2: Find .ovpn config file ───────────────────────────
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_info(f"Looking for .ovpn config files in: {script_dir}")
+
+    ovpn_files = glob.glob(os.path.join(script_dir, "*.ovpn"))
+
+    if not ovpn_files:
+        log_err(
+            "No .ovpn config file found!\n"
+            f"  Please place your .ovpn file in: {script_dir}\n"
+            "  Then run the script again."
+        )
+        return
+
+    # If multiple .ovpn files found, let user choose
+    if len(ovpn_files) == 1:
+        ovpn_config = ovpn_files[0]
+        log_success(f"Found config: {os.path.basename(ovpn_config)}")
+    else:
+        print()
+        log_info("Multiple .ovpn files found:")
+        for i, f in enumerate(ovpn_files, 1):
+            print(f"  {Colors.OKCYAN}[{i}]{Colors.ENDC} {os.path.basename(f)}")
+        print()
+
+        while True:
+            try:
+                choice = input(
+                    f"{Colors.OKBLUE}[?] Select config file "
+                    f"[1-{len(ovpn_files)}]: {Colors.ENDC}"
+                ).strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(ovpn_files):
+                    ovpn_config = ovpn_files[idx]
+                    break
+                else:
+                    log_warn(f"Please enter a number between 1 and {len(ovpn_files)}")
+            except ValueError:
+                log_warn("Please enter a valid number.")
+            except (KeyboardInterrupt, EOFError):
+                print()
+                log_warn("OpenVPN setup cancelled.")
+                return
+
+    log_success(f"Using config: {os.path.basename(ovpn_config)}")
+
+    # ── Step 3: Ask for username and password ────────────────────
+    print()
+    log_info("OpenVPN credentials required:")
+    print()
+
+    try:
+        username = input(
+            f"  {Colors.OKCYAN}Username:{Colors.ENDC} "
+        ).strip()
+
+        if not username:
+            log_warn("Empty username — skipping OpenVPN connection.")
+            return
+
+        # Use getpass for hidden password input
+        import getpass
+        password = getpass.getpass(
+            f"  {Colors.OKCYAN}Password:{Colors.ENDC} "
+        ).strip()
+
+        if not password:
+            log_warn("Empty password — skipping OpenVPN connection.")
+            return
+
+    except (KeyboardInterrupt, EOFError):
+        print()
+        log_warn("OpenVPN setup cancelled.")
+        return
+
+    # ── Step 4: Write credentials to a temp file ─────────────────
+    # OpenVPN can read username/password from a file using
+    # --auth-user-pass <file> where file has two lines:
+    # line 1 = username
+    # line 2 = password
+    creds_file = "/tmp/.ovpn_credentials"
+    try:
+        with open(creds_file, "w") as fh:
+            fh.write(f"{username}\n{password}\n")
+        os.chmod(creds_file, 0o600)
+        log_info("Credentials saved to temporary file.")
+    except Exception as exc:
+        log_err(f"Failed to write credentials file: {exc}")
+        return
+
+    # ── Step 5: Patch config to use credentials file ─────────────
+    # We create a modified copy so the original .ovpn stays intact.
+    patched_config = "/tmp/.ovpn_patched.ovpn"
+    try:
+        with open(ovpn_config, "r") as fh:
+            config_content = fh.read()
+
+        # Replace 'auth-user-pass' (without a file path) with
+        # 'auth-user-pass <creds_file>' so OpenVPN reads creds
+        # automatically without prompting.
+        if "auth-user-pass" in config_content:
+            # Remove any existing auth-user-pass line
+            config_content = re.sub(
+                r'^auth-user-pass.*$',
+                f'auth-user-pass {creds_file}',
+                config_content,
+                flags=re.MULTILINE,
+            )
+        else:
+            # Add auth-user-pass if not present at all
+            config_content += f"\nauth-user-pass {creds_file}\n"
+
+        with open(patched_config, "w") as fh:
+            fh.write(config_content)
+        os.chmod(patched_config, 0o600)
+
+        log_info("Config patched to use credentials file.")
+    except Exception as exc:
+        log_err(f"Failed to patch OpenVPN config: {exc}")
+        return
+
+    # ── Step 6: Kill any existing OpenVPN connections ────────────
+    log_info("Stopping any existing OpenVPN connections...")
+    subprocess.run(
+        ['killall', 'openvpn'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)
+
+    # ── Step 7: Connect to OpenVPN ───────────────────────────────
+    log_info(
+        f"Connecting to OpenVPN using: "
+        f"{os.path.basename(ovpn_config)}..."
+    )
+
+    # OpenVPN log file
+    ovpn_log = "/tmp/openvpn.log"
+
+    try:
+        openvpn_proc = subprocess.Popen(
+            [
+                'openvpn',
+                '--config', patched_config,
+                '--daemon',
+                '--log', ovpn_log,
+                '--writepid', '/tmp/openvpn.pid',
+                '--connect-retry', '3',
+                '--connect-retry-max', '5',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log_err(f"Failed to launch OpenVPN: {exc}")
+        return
+
+    # ── Step 8: Wait for connection and verify ───────────────────
+    log_info("Waiting for OpenVPN to connect (up to 30 seconds)...")
+
+    connected = False
+    for attempt in range(1, 31):
+        time.sleep(1)
+
+        # Check if OpenVPN is still running
+        openvpn_running = subprocess.run(
+            ['pgrep', '-x', 'openvpn'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+
+        if not openvpn_running:
+            log_err("OpenVPN process died!")
+            # Show last few lines of log for debugging
+            if os.path.exists(ovpn_log):
+                try:
+                    with open(ovpn_log) as fh:
+                        lines = fh.readlines()
+                    log_err("Last 10 lines of OpenVPN log:")
+                    for line in lines[-10:]:
+                        print(f"  {Colors.FAIL}{line.rstrip()}{Colors.ENDC}")
+                except Exception:
+                    pass
+            break
+
+        # Check if tun interface is up (means VPN connected)
+        try:
+            result = subprocess.run(
+                ['ip', 'addr', 'show', 'tun0'],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0 and 'inet ' in result.stdout:
+                connected = True
+                break
+        except Exception:
+            pass
+
+        # Also check log for success message
+        if os.path.exists(ovpn_log):
+            try:
+                with open(ovpn_log) as fh:
+                    log_content = fh.read()
+                if "Initialization Sequence Completed" in log_content:
+                    connected = True
+                    break
+            except Exception:
+                pass
+
+        if attempt % 5 == 0:
+            log_info(f"  Still connecting... {attempt}/30")
+
+    if connected:
+        # Get VPN IP address
+        vpn_ip = "unknown"
+        try:
+            result = subprocess.run(
+                ['ip', '-4', 'addr', 'show', 'tun0'],
+                capture_output=True, text=True,
+            )
+            match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
+            if match:
+                vpn_ip = match.group(1)
+        except Exception:
+            pass
+
+        C = Colors
+        sep = '─' * 50
+        print(f"\n{C.OKCYAN}{sep}{C.ENDC}")
+        print(f"  🔒  {C.BOLD}{C.OKGREEN}OpenVPN Connected!{C.ENDC}")
+        print(f"{C.OKCYAN}{sep}{C.ENDC}")
+        print(f"  Config : {os.path.basename(ovpn_config)}")
+        print(f"  VPN IP : {C.OKGREEN}{vpn_ip}{C.ENDC}")
+        print(f"  Log    : {ovpn_log}")
+        print(f"{C.OKCYAN}{sep}{C.ENDC}\n")
+    else:
+        log_err(
+            "OpenVPN connection timed out or failed.\n"
+            f"  Check log: cat {ovpn_log}"
+        )
+
+    # ── Cleanup: remove credentials file after connection ────────
+    # (OpenVPN has already read it, no longer needed on disk)
+    try:
+        if os.path.exists(creds_file):
+            os.remove(creds_file)
+            log_info("Credentials file removed from disk.")
+    except Exception:
+        pass
+
+
+def create_openvpn_desktop_shortcut() -> None:
+    """
+    Create a desktop shortcut that shows OpenVPN status
+    and provides quick connect/disconnect commands.
+    """
+    desktop_dir = os.path.expanduser("~/Desktop")
+    os.makedirs(desktop_dir, exist_ok=True)
+
+    shortcut = os.path.join(desktop_dir, "openvpn.desktop")
+    content = """[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OpenVPN Status
+Comment=OpenVPN VPN Status and Controls
+Exec=xfce4-terminal --hold -e "bash -c '
+echo \\"════════════════════════════════════════\\"
+echo \\"  🔒 OpenVPN Status\\"
+echo \\"════════════════════════════════════════\\"
+echo
+if pgrep -x openvpn > /dev/null; then
+    echo \\"  Status : ✅ CONNECTED\\"
+    VPN_IP=$(ip -4 addr show tun0 2>/dev/null | grep -oP \\"inet \\\\K[\\\\d.]+\\")
+    echo \\"  VPN IP : $VPN_IP\\"
+    echo
+    echo \\"  To disconnect:\\"
+    echo \\"    sudo killall openvpn\\"
+else
+    echo \\"  Status : ❌ DISCONNECTED\\"
+    echo
+    echo \\"  To connect:\\"
+    echo \\"    sudo openvpn --config /path/to/your.ovpn\\"
+fi
+echo
+echo \\"════════════════════════════════════════\\"
+exec bash'"
+Icon=network-vpn
+Terminal=false
+Categories=Network;VPN;
+"""
+    try:
+        with open(shortcut, "w") as fh:
+            fh.write(content)
+        os.chmod(shortcut, 0o755)
+
+        subprocess.run(
+            [
+                'dbus-launch', 'gio', 'set', shortcut,
+                'metadata::trusted', 'true',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log_info("  Created shortcut: openvpn.desktop")
+    except Exception as exc:
+        log_warn(f"  Failed to create OpenVPN shortcut: {exc}")
 # ══════════════════════════════════════════════════════════════════
 # 12. CLOUDFLARED
 # ══════════════════════════════════════════════════════════════════
@@ -1652,21 +1979,25 @@ def main():
     install_proton_vpn()
     #install_windscribe()
 
-    # ── Step 5: Install Cloudflare tunnel ────────────────────────
-    log_info("Step 5/7: Installing Cloudflare tunnel client...")
+    # ── Step 5: OpenVPN setup ────────────────────────────────────
+    log_info("Step 5/9: OpenVPN setup...")
+    install_and_connect_openvpn()
+
+    # ── Step 6: Install Cloudflare tunnel ────────────────────────
+    log_info("Step 6/9: Installing Cloudflare tunnel client...")
     install_cloudflared()
 
-    # ── Step 6: Create desktop shortcuts ─────────────────────────
-    log_info("Step 6/7: Creating desktop shortcuts...")
+    # ── Step 7: Create desktop shortcuts ─────────────────────────
+    log_info("Step 7/9: Creating desktop shortcuts...")
     create_desktop_shortcuts()
 
-    # ── Step 7: Optimize XFCE for VNC performance ────────────────
-    log_info("Step 7/8: Optimizing desktop for low-latency VNC...")
+    # ── Step 8: Optimize XFCE for VNC performance ────────────────
+    log_info("Step 8/9: Optimizing desktop for low-latency VNC...")
     optimize_xfce_performance()
 
-    # ── Step 8: Launch and supervise all services ────────────────
+    # ── Step 9: Launch and supervise all services ────────────────
     print()
-    log_info("Step 8/8: Starting desktop services...")
+    log_info("Step 9/9: Starting desktop services...")
     print()
 
     supervisor = ServiceSupervisor(vnc_password, novnc_dir)
