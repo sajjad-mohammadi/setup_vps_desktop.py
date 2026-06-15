@@ -16,14 +16,12 @@ import subprocess
 import urllib.request
 import socket
 import time
-import threading
 import re
 import platform
 import shutil
 import random
 import string
 import getpass
-from typing import Optional
 
 # ══════════════════════════════════════════════════════════════════
 # 1. TERMINAL COLOURS
@@ -97,40 +95,55 @@ def save_original_network() -> None:
 
 def protect_cloudflare_routes(tunnel_url: str = None) -> None:
     """
-    Forces Cloudflare tunnel traffic to use the original network gateway.
-    This bypasses OpenVPN entirely, preventing VNC drops.
+    Forces ONLY the Cloudflare tunnel traffic to bypass the VPN.
+    All other websites (even those hosted on Cloudflare) will route through the VPN.
     """
     if not _SAVED_GATEWAY or not _SAVED_INTERFACE:
         return
 
-    log_info("Enforcing Cloudflare OpenVPN Bypass Rules...")
+    log_info("Enforcing strict /32 Cloudflare Bypass Rules (Tunnel ONLY)...")
+    target_ips = set()
 
-    # Broad Cloudflare IPs (Argo Tunnels / API)
-    cf_ranges = [
-        "104.16.0.0/13", "104.24.0.0/14", "198.41.192.0/20", "198.41.208.0/20",
-        "162.158.0.0/15", "172.64.0.0/13", "131.0.72.0/22", "141.101.64.0/18",
-        "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "108.162.192.0/18",
-        "173.245.48.0/20"
-    ]
+    # 1. Resolve specific domains required for the tunnel
+    domains = ['region1.v2.argotunnel.com', 'region2.v2.argotunnel.com', 'api.cloudflare.com']
 
-    domains = ['region1.v2.argotunnel.com', 'region2.v2.argotunnel.com', 'trycloudflare.com']
     if tunnel_url:
-        domains.append(tunnel_url.replace("https://", "").replace("http://", "").split("/")[0])
+        # Extract the exact subdomain (e.g. random-words.trycloudflare.com)
+        host = tunnel_url.replace("https://", "").replace("http://", "").split("/")[0]
+        domains.append(host)
 
-    # 1. Protect specific IPs resolved from domains
-    for host in domains:
+    for domain in domains:
         try:
-            ips = [r[4][0] for r in socket.getaddrinfo(host, None) if '.' in r[4][0]]
-            cf_ranges.extend([f"{ip}/32" for ip in ips])
+            addrs = socket.getaddrinfo(domain, None)
+            for addr in addrs:
+                ip = addr[4][0]
+                if '.' in ip: # Ensure IPv4
+                    target_ips.add(ip)
         except Exception:
             pass
 
-    # 2. Apply rules
-    for cidr in set(cf_ranges):
-        subprocess.run(['ip', 'route', 'replace', cidr, 'via', _SAVED_GATEWAY, 'dev', _SAVED_INTERFACE],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 2. DYNAMIC DETECTION (Bulletproof)
+    # Check the actual active network connections of the 'cloudflared' process
+    try:
+        ss_output = run_cmd("ss -tnp | grep cloudflared", check=False)
+        for match in re.finditer(r'(\d+\.\d+\.\d+\.\d+):(443|7844)', ss_output):
+            target_ips.add(match.group(1))
+    except Exception:
+        pass
+
+    if not target_ips:
+        log_warn("No tunnel IPs found to protect!")
+        return
+
+    # 3. Apply exact /32 rules (only these specific IPs bypass the VPN)
+    for ip in target_ips:
+        subprocess.run(
+            ['ip', 'route', 'replace', f"{ip}/32", 'via', _SAVED_GATEWAY, 'dev', _SAVED_INTERFACE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
     
-    log_success("VNC/Cloudflare traffic protected from VPN disruption.")
+    log_success(f"Isolated {len(target_ips)} exact Tunnel IPs.")
+    log_success("ALL other web traffic (including normal Cloudflare websites) will use the VPN.")
 
 # ══════════════════════════════════════════════════════════════════
 # 4. SYSTEM INSTALLATION
@@ -229,7 +242,7 @@ def start_novnc(novnc_dir: str, vnc_password: str):
     run_cmd("fuser -k 6080/tcp 2>/dev/null", check=False)
     time.sleep(1)
     
-    # Force 127.0.0.1 to avoid IPv6 issues
+    # Force 127.0.0.1 to avoid IPv6 dropping connections
     proc = subprocess.Popen(['websockify', '--web', novnc_dir, '6080', '127.0.0.1:5901'],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log_success("NoVNC Websockify Started on port 6080.")
@@ -283,15 +296,21 @@ class Supervisor:
             print(f"{C.OKCYAN}═════════════════════════════════════════════════{C.ENDC}")
             
             ovpn_files = sorted(glob.glob(os.path.join(script_dir, "*.ovpn")))
-            for i, f in enumerate(ovpn_files, 1):
-                print(f"  [{i}] Connect to: {os.path.basename(f)}")
+            if not ovpn_files:
+                print(f"  {C.WARNING}No .ovpn files found in {script_dir}.{C.ENDC}")
+            else:
+                for i, f in enumerate(ovpn_files, 1):
+                    print(f"  [{i}] Connect to: {os.path.basename(f)}")
             
             print("  [D] Disconnect OpenVPN")
             print("  [R] Refresh / Enforce Firewall Bypass")
             print("  [Q] Exit to Terminal (Services keep running)")
             
-            choice = input(f"\n{C.OKBLUE}[?] Choose an option: {C.ENDC}").strip().upper()
-            
+            try:
+                choice = input(f"\n{C.OKBLUE}[?] Choose an option: {C.ENDC}").strip().upper()
+            except KeyboardInterrupt:
+                break
+                
             if choice == 'Q':
                 break
             elif choice == 'R':
@@ -310,9 +329,12 @@ class Supervisor:
         # Enforce Cloudflare bypass routes before initiating connection
         protect_cloudflare_routes(self.tunnel_url)
         
-        user = input(f"{Colors.OKCYAN}OpenVPN Username: {Colors.ENDC}").strip()
-        pwd = getpass.getpass(f"{Colors.OKCYAN}OpenVPN Password: {Colors.ENDC}").strip()
-        
+        try:
+            user = input(f"{Colors.OKCYAN}OpenVPN Username: {Colors.ENDC}").strip()
+            pwd = getpass.getpass(f"{Colors.OKCYAN}OpenVPN Password: {Colors.ENDC}").strip()
+        except KeyboardInterrupt:
+            return
+            
         creds_file = "/tmp/.ovpn_cred"
         with open(creds_file, "w") as f:
             f.write(f"{user}\n{pwd}\n")
